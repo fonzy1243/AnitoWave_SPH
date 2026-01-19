@@ -5,6 +5,10 @@ set(CMAKE_CUDA_STANDARD 23)
 
 if (MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
 endif ()
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
@@ -46,6 +50,7 @@ if ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
             bxDebug
             bimg_decodeDebug
     )
+    target_compile_definitions(AnitoWave_SPH PRIVATE BX_CONFIG_DEBUG)
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "Release")
     if (NOT EXISTS "${PROJECT_SOURCE_DIR}/bgfx/.build/win64_vs2022/bin/bgfxRelease.lib")
         message(FATAL_ERROR "BGFX not build as release.")
