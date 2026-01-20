@@ -6,10 +6,18 @@
 #include <bgfx/platform.h>
 #include <GLFW/glfw3.h>
 
+#include "bgfx_utils.h"
+#include "../include/sph.cuh"
+
 #ifdef _WIN64
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
 #endif
+
+struct Particle {
+    float2 pos;
+    float2 vel;
+};
 
 struct PosColorVertex {
     float x, y, z;
@@ -54,6 +62,9 @@ private:
     bool m_showStats = false;
     const bgfx::ViewId m_kClearView = 0;
 
+    // bgfx programs
+    bgfx::ProgramHandle m_program;
+
     // Particle rendering data
     bgfx::VertexLayout m_particleLayout;
     std::vector<PosColorVertex> m_circleTemplate;
@@ -63,12 +74,16 @@ private:
     std::vector<float> m_particlePositions;
     std::vector<uint32_t> m_particleColors;
     float m_particleRadius = 0.02f;
+
+    // SPH class
+    SPHSolver* m_solver = nullptr;
 };
 
 AnitoWave::AnitoWave(const Config &config) : m_config(config), m_width(config.width), m_height(config.height) {
 }
 
 AnitoWave::~AnitoWave() {
+    delete m_solver;
     if (m_window) {
         bgfx::shutdown();
         glfwTerminate();
@@ -78,26 +93,27 @@ AnitoWave::~AnitoWave() {
 void AnitoWave::initParticleRendering() {
     m_particleLayout.begin()
         .add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float)
-        .add(bgfx::Attrib::Color0, 4, bgfx::AttribType::Uint8)
+        .add(bgfx::Attrib::Color0, 4, bgfx::AttribType::Uint8, true)
         .end();
 
     generateCircleTemplate(1.0f, 32);
 
-    const int numParticles = 100;
+    const int numParticles = 10;
     m_particlePositions.reserve(numParticles * 2);
     m_particleColors.reserve(numParticles);
 
-    for (int i = 0; i < numParticles; ++i) {
-        float angle = (float)i / numParticles * bx::kPi * 2.0f;
-        float radius = 0.3f + 0.2f * bx::sin(angle * 3.0f);
-        m_particlePositions.push_back(bx::cos(angle) * radius);
-        m_particlePositions.push_back(bx::sin(angle) * radius);
+    m_particlePositions.push_back(0.0f);
+    m_particlePositions.push_back(0.5f);
 
-        uint8_t r = 0;
-        uint8_t g = 0;
-        uint8_t b = 255;
-        m_particleColors.push_back(0xff000000 | (b << 16) | (g << 8) | r);
-    }
+    m_particleColors.push_back(0xffff0000);
+
+    m_solver = new SPHSolver(numParticles);
+
+    const std::vector initVelocities(numParticles * 2, 0.0f);
+
+    m_program = loadProgram("vs_particles", "fs_particles");
+
+    m_solver->init(m_particlePositions, initVelocities);
 }
 
 void AnitoWave::generateCircleTemplate(float radius, int segments) {
@@ -171,7 +187,7 @@ void AnitoWave::renderParticles() {
         bgfx::setVertexBuffer(0, &tvb);
         bgfx::setIndexBuffer(&tib);
         bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_BLEND_ALPHA);
-        bgfx::submit(m_kClearView, BGFX_INVALID_HANDLE);
+        bgfx::submit(m_kClearView, m_program);
     }
 }
 
@@ -238,12 +254,10 @@ void AnitoWave::run() {
         bgfx::touch(m_kClearView);
         // Simulation and rendering
         time += 0.016f;
-        const size_t numParticles = m_particlePositions.size() / 2;
-        for (size_t i = 0; i < numParticles; ++i) {
-            float angle = (float)i / numParticles * bx::kPi * 2.0f + time;
-            float radius = 0.3f + 0.2f * bx::sin(angle * 3.0f + time * 2.0f);
-            m_particlePositions[i * 2] = bx::cos(angle) * radius;
-            m_particlePositions[i * 2 + 1] = bx::sin(angle) * radius;
+
+        if (m_solver) {
+            m_solver->update(0.016f);
+            m_solver->getPositions(m_particlePositions);
         }
 
         renderParticles();
