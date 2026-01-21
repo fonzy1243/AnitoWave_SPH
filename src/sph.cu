@@ -1,4 +1,5 @@
 #include <sph.cuh>
+#include <numbers>
 #include <bx/math.h>
 #include <thrust/sort.h>
 #include <thrust/device_ptr.h>
@@ -29,6 +30,28 @@ __device__ float length(float2 v) {
 
 __device__ float sign(float x) {
     return x < 0.0f ? -1.0f : 1.0f;
+}
+
+__device__ float SmoothingKernel(float radius, float dst) {
+    float volume = std::numbers::pi_v<float> * powf(radius, 8) / 4.0f;
+    float value = max(0.0f, radius * radius - dst * dst);
+    return value * value * value / volume;
+}
+
+__device__ float CalculateDensity(float* positions, int numParticles, float2 samplePoint, float smoothingRadius) {
+    float density = 0.0f;
+    const float mass = 1.0f;
+
+    for (int i = 0; i < numParticles; i++) {
+        int idx = i * 2;
+        float2 position = make_float2(positions[idx], positions[idx + 1]);
+
+        float dst = length(position - samplePoint);
+        float influence = SmoothingKernel(smoothingRadius, dst);
+        density += mass * influence;
+    }
+
+    return density;
 }
 
 __device__ void ResolveCollisions(float* positions, float* velocities, int numParticles, float particleSize, float boundsX, float boundsY, float collisionDamping) {
