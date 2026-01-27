@@ -103,6 +103,7 @@ target_include_directories(AnitoWave_SPH PRIVATE
 
 target_link_directories(AnitoWave_SPH PRIVATE ./bgfx/.build/win64_vs2022/bin/)
 
+
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
     if (NOT EXISTS "${PROJECT_SOURCE_DIR}/bgfx/.build/win64_vs2022/bin/bgfxDebug.lib")
         message(FATAL_ERROR "BGFX not build as debug.")
@@ -112,8 +113,9 @@ if ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
             bimgDebug
             bxDebug
             bimg_decodeDebug
+            dear-imgui
     )
-    target_compile_definitions(AnitoWave_SPH PRIVATE BX_CONFIG_DEBUG)
+    target_compile_definitions(AnitoWave_SPH PRIVATE BX_CONFIG_DEBUG=1)
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "Release")
     if (NOT EXISTS "${PROJECT_SOURCE_DIR}/bgfx/.build/win64_vs2022/bin/bgfxRelease.lib")
         message(FATAL_ERROR "BGFX not build as release.")
@@ -124,7 +126,41 @@ elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "Release")
             bimgRelease
             bxRelease
     )
+    target_compile_definitions(AnitoWave_SPH PRIVATE BX_CONFIG_DEBUG=0)
 endif ()
+
+set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/bgfx/3rdparty/dear-imgui)
+file(GLOB IMGUI_SOURCES
+        ${IMGUI_DIR}/imgui.cpp
+        ${IMGUI_DIR}/imgui_draw.cpp
+        ${IMGUI_DIR}/imgui_tables.cpp
+        ${IMGUI_DIR}/imgui_widgets.cpp
+)
+
+set(BGFX_IMGUI_DIR ${CMAKE_SOURCE_DIR}/bgfx/examples/common/imgui)
+list(APPEND IMGUI_SOURCES
+        ${BGFX_IMGUI_DIR}/imgui.cpp
+)
+
+add_library(dear-imgui STATIC ${IMGUI_SOURCES})
+target_include_directories(dear-imgui PUBLIC
+        ${IMGUI_DIR}
+        ${CMAKE_SOURCE_DIR}/bgfx/include
+        ${CMAKE_SOURCE_DIR}/bx/include
+        ${CMAKE_SOURCE_DIR}/bimg/include
+        ${CMAKE_SOURCE_DIR}/bgfx/3rdparty
+)
+target_link_libraries(AnitoWave_SPH dear-imgui)
+
+if ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
+    target_compile_definitions(dear-imgui PRIVATE BX_CONFIG_DEBUG=1)
+else ()
+    target_compile_definitions(dear-imgui PRIVATE BX_CONFIG_DEBUG=0)
+endif()
+
+if (MSVC)
+    target_include_directories(dear-imgui PUBLIC "${CMAKE_SOURCE_DIR}/bx/include/compat/msvc")
+endif()
 
 set_target_properties(AnitoWave_SPH PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON)
