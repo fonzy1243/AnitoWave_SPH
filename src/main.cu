@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <vector>
+#include <imgui/imgui.h>
 #include <bx/bx.h>
 #include <bx/math.h>
 #include <bgfx/bgfx.h>
@@ -28,8 +29,8 @@ class AnitoWave {
 public:
     struct Config {
         const char* title = "AnitoWave";
-        uint32_t width = 1600;
-        uint32_t height = 900;
+        uint32_t width = 1920;
+        uint32_t height = 1080;
         bgfx::RendererType::Enum rendererType = bgfx::RendererType::Vulkan;
         bool vsync = true;
     };
@@ -49,9 +50,11 @@ public:
 private:
     static void glfwErrorCallback(int error, const char* description);
     static void glfwKeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods);
+    static void glfwScrollCallback(GLFWwindow* window, double xoffset, double yoffset);
 
     void initParticleRendering();
     void renderParticles();
+    void renderImGui();
     void generateCircleTemplate(float radius, int segments);
     void setupOrtho();
 
@@ -59,7 +62,9 @@ private:
     GLFWwindow* m_window = nullptr;
     uint32_t m_width;
     uint32_t m_height;
+    int32_t m_scroll = 0;
     bool m_showStats = false;
+    bool m_showParamEditor = true;
     const bgfx::ViewId m_kClearView = 0;
 
     // bgfx programs
@@ -68,12 +73,12 @@ private:
     // Particle rendering data
     bgfx::VertexLayout m_particleLayout;
     std::vector<PosColorVertex> m_circleTemplate;
-    std::vector<uint16_t> m_circleIndices;
+    std::vector<uint32_t> m_circleIndices;
 
     // SPH particle data
     std::vector<float> m_particlePositions;
     std::vector<uint32_t> m_particleColors;
-    float m_particleRadius = 0.02f;
+    float m_particleRadius = 0.1f;
 
     // SPH class
     SPHSolver* m_solver = nullptr;
@@ -96,16 +101,30 @@ void AnitoWave::initParticleRendering() {
         .add(bgfx::Attrib::Color0, 4, bgfx::AttribType::Uint8, true)
         .end();
 
-    generateCircleTemplate(1.0f, 32);
+    generateCircleTemplate(m_particleRadius, 32);
 
-    const int numParticles = 10;
+    int particlesPerRow = 70;
+    int numParticles = particlesPerRow * particlesPerRow;
+    float spacing = m_particleRadius * 2.0f;
+    float startX = -((particlesPerRow - 1) * spacing) / 2.0f;
+    float startY = 0.5f;
+
     m_particlePositions.reserve(numParticles * 2);
     m_particleColors.reserve(numParticles);
 
-    m_particlePositions.push_back(0.0f);
-    m_particlePositions.push_back(0.5f);
+    for (int y = 0; y < particlesPerRow; ++y) {
+        for (int x = 0; x < particlesPerRow; ++x) {
+            float px = startX + x * spacing;
+            float py = startY + y * spacing;
 
-    m_particleColors.push_back(0xffff0000);
+            m_particlePositions.push_back(px);
+            m_particlePositions.push_back(py);
+
+            m_particleColors.push_back(0xffff0000);
+        }
+    }
+
+    // Init SPH particles
 
     m_solver = new SPHSolver(numParticles);
 
@@ -114,6 +133,8 @@ void AnitoWave::initParticleRendering() {
     m_program = loadProgram("vs_particles", "fs_particles");
 
     m_solver->init(m_particlePositions, initVelocities);
+
+    m_particleRadius = m_solver->getParams().particleSize;
 }
 
 void AnitoWave::generateCircleTemplate(float radius, int segments) {
@@ -122,7 +143,7 @@ void AnitoWave::generateCircleTemplate(float radius, int segments) {
 
     m_circleTemplate.push_back({0.f, 0.f, 0.f, 0xffffffff});
 
-    for (int i = 0; i <= segments; ++i) {
+    for (int i = 0; i < segments; ++i) {
         float angle = (float)i / segments * bx::kPi * 2.0f;
         float x = bx::cos(angle) * radius;
         float y = bx::sin(angle) * radius;
@@ -132,20 +153,22 @@ void AnitoWave::generateCircleTemplate(float radius, int segments) {
     for (int i = 0; i < segments; ++i) {
         m_circleIndices.push_back(0);
         m_circleIndices.push_back(i + 1);
-        m_circleIndices.push_back(i + 2);
+        m_circleIndices.push_back((i + 1) % segments + 1);
     }
 }
 
 void AnitoWave::setupOrtho() {
     const float aspect = (float)m_width / (float)m_height;
+    const float height = 2.0f;
+    const float width = height * aspect;
     float proj[16];
-    bx::mtxOrtho(proj, -aspect, aspect, -1.0f, 1.0f, 0.0f, 100.0f, 0.0f, bgfx::getCaps()->homogeneousDepth);
+    bx::mtxOrtho(proj, -width / 2, width / 2, -height / 2, height / 2, 0.0f, 100.0f, 0.0f, bgfx::getCaps()->homogeneousDepth);
     bgfx::setViewTransform(m_kClearView, nullptr, proj);
 }
 
 void AnitoWave::renderParticles() {
     std::vector<PosColorVertex> vertices;
-    std::vector<uint16_t> indices;
+    std::vector<uint32_t> indices;
 
     const size_t vertsPerCircle = m_circleTemplate.size();
     const size_t indicesPerCircle = m_circleIndices.size();
@@ -159,7 +182,7 @@ void AnitoWave::renderParticles() {
         float py = m_particlePositions[i * 2 + 1];
         uint32_t color = m_particleColors[i];
 
-        uint16_t baseVertex = vertices.size();
+        uint32_t baseVertex = vertices.size();
 
         for (const auto& v : m_circleTemplate) {
             vertices.push_back({
@@ -170,7 +193,7 @@ void AnitoWave::renderParticles() {
             });
         }
 
-        for (uint16_t idx: m_circleIndices) {
+        for (uint32_t idx: m_circleIndices) {
             indices.push_back(baseVertex + idx);
         }
     }
@@ -180,15 +203,79 @@ void AnitoWave::renderParticles() {
     bgfx::TransientVertexBuffer tvb{};
     bgfx::TransientIndexBuffer tib{};
 
-    if (bgfx::allocTransientBuffers(&tvb, m_particleLayout, vertices.size(), &tib, indices.size())) {
+    if (bgfx::allocTransientBuffers(&tvb, m_particleLayout, vertices.size(), &tib, indices.size(), true)) {
         bx::memCopy(tvb.data, vertices.data(), vertices.size() * sizeof(PosColorVertex));
-        bx::memCopy(tib.data, indices.data(), indices.size() * sizeof(uint16_t));
+        bx::memCopy(tib.data, indices.data(), indices.size() * sizeof(uint32_t));
 
         bgfx::setVertexBuffer(0, &tvb);
         bgfx::setIndexBuffer(&tib);
-        bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_BLEND_ALPHA);
+        bgfx::setState(BGFX_STATE_WRITE_RGB
+             | BGFX_STATE_WRITE_A
+             | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_INV_SRC_ALPHA));
         bgfx::submit(m_kClearView, m_program);
     }
+}
+
+void AnitoWave::renderImGui() {
+    double mx, my;
+    glfwGetCursorPos(m_window, &mx, &my);
+
+    uint8_t mouseButtons = 0;
+    if (glfwGetMouseButton(m_window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
+        mouseButtons |= IMGUI_MBUT_LEFT;
+    }
+    if (glfwGetMouseButton(m_window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS) {
+        mouseButtons |= IMGUI_MBUT_RIGHT;
+    }
+    if (glfwGetMouseButton(m_window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS) {
+        mouseButtons |= IMGUI_MBUT_MIDDLE;
+    }
+
+    imguiBeginFrame(
+        (int32_t)mx,  // mouse x
+        (int32_t)my,  // mouse y
+        mouseButtons,  // mouse buttons
+        m_scroll,  // mouse scroll
+        m_width,
+        m_height
+    );
+
+    m_scroll = 0;
+
+    if (m_showParamEditor && m_solver) {
+        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(300, 400), ImGuiCond_FirstUseEver);
+
+        if (ImGui::Begin("SPH Parameters", &m_showParamEditor)) {
+            SPHParams& params = m_solver->getParams();
+
+            ImGui::Text("Particle Properties");
+            ImGui::SliderFloat("Particle Size", &params.particleSize, 0.01f, 0.2f);
+            ImGui::SliderFloat("Smoothing Radius", &params.smoothingRadius, 0.1f, 1.0f);
+
+            ImGui::Separator();
+            ImGui::Text("Forces");
+            ImGui::SliderFloat("Gravity", &params.gravity, 0.0f, 20.0f);
+            ImGui::SliderFloat("Viscosity", &params.viscosityStrength, 0.0f, 20.0f);
+            ImGui::SliderFloat("Target Density", &params.targetDensity, 5.0f, 2000.0f);
+            ImGui::SliderFloat("Pressure Multiplier", &params.pressureMultiplier, 10.0f, 2000.0f);
+            ImGui::SliderFloat("Near Pressure Multiplier", &params.nearPressureMultiplier, 0.0f, 100.0f);
+
+            ImGui::Separator();
+            ImGui::Text("Collision");
+            ImGui::SliderFloat("Collision Damping", &params.collisionDamping, 0.0f, 1.0f);
+            ImGui::SliderFloat("Bounds X", &params.boundsX, 1.0f, 10.0f);
+            ImGui::SliderFloat("Bounds Y", &params.boundsY, 1.0f, 10.0f);
+
+            ImGui::Separator();
+            if (ImGui::Button("Reset to Defaults")) {
+                params = SPHParams();
+            }
+        }
+        ImGui::End();
+    }
+
+    imguiEndFrame();
 }
 
 bool AnitoWave::init() {
@@ -207,6 +294,7 @@ bool AnitoWave::init() {
     }
     glfwSetWindowUserPointer(m_window, this);
     glfwSetKeyCallback(m_window, glfwKeyCallback);
+    glfwSetScrollCallback(m_window, glfwScrollCallback);
     // Calling bgfx::renderFrame to signal bgfx not to create a render thread
     bgfx::renderFrame();
     // Initialize bgfx
@@ -230,6 +318,8 @@ bool AnitoWave::init() {
     bgfx::setViewClear(m_kClearView, BGFX_CLEAR_COLOR);
     bgfx::setViewRect(m_kClearView, 0, 0, bgfx::BackbufferRatio::Equal);
 
+    imguiCreate();
+
     initParticleRendering();
     setupOrtho();
 
@@ -237,7 +327,7 @@ bool AnitoWave::init() {
 }
 
 void AnitoWave::run() {
-    float time = 0.0f;
+    double lastTime = glfwGetTime();
 
     while (!glfwWindowShouldClose(m_window)) {
         glfwPollEvents();
@@ -252,15 +342,26 @@ void AnitoWave::run() {
         }
 
         bgfx::touch(m_kClearView);
-        // Simulation and rendering
-        time += 0.016f;
 
-        if (m_solver) {
-            m_solver->update(0.016f);
-            m_solver->getPositions(m_particlePositions);
+        double currentTime = glfwGetTime();
+        float dt = (float)(currentTime - lastTime);
+        dt = max(dt, 0.016f);
+        lastTime = currentTime;
+
+        const int substeps = 3;
+        float subDt = dt / substeps;
+
+        // Simulation and rendering
+        for (int i = 0; i < substeps; i++) {
+            if (m_solver) {
+                m_solver->update(subDt);
+            }
         }
 
+        m_solver->getPositions(m_particlePositions);
+
         renderParticles();
+        renderImGui();
 
         bgfx::setDebug(m_showStats ? BGFX_DEBUG_STATS : BGFX_DEBUG_TEXT);
         bgfx::frame();
@@ -275,6 +376,17 @@ void AnitoWave::glfwKeyCallback(GLFWwindow *window, int key, int scancode, int a
     AnitoWave* app = static_cast<AnitoWave *>(glfwGetWindowUserPointer(window));
     if (app && key == GLFW_KEY_F1 && action == GLFW_RELEASE) {
         app->m_showStats = !app->m_showStats;
+    }
+
+    if (app && key == GLFW_KEY_F2 && action == GLFW_RELEASE) {
+        app->m_showParamEditor = !app->m_showParamEditor;
+    }
+}
+
+void AnitoWave::glfwScrollCallback(GLFWwindow *window, double xoffset, double yoffset) {
+    AnitoWave* app = static_cast<AnitoWave *>(glfwGetWindowUserPointer(window));
+    if (app) {
+        app->m_scroll += (int32_t)yoffset;
     }
 }
 
