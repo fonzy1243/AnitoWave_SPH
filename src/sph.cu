@@ -221,42 +221,40 @@ __device__ float2 CalculateSharedPressure(float densityA, float nearDensityA, fl
     );
 }
 
-__device__ float SmoothingKernel(float dst, float radius) {
+__device__ float SmoothingKernel(float dst, float radius, float scale) {
     if (dst >= radius) return 0.0f;
-    float scale = 15.0f / (2.0f * std::numbers::pi_v<float> * powf(radius, 5.0f));
     float v = radius - dst;
     return v * v * scale;
 }
 
-__device__ float SmoothingKernelDerivative(float dst, float radius) {
+__device__ float SmoothingKernelDerivative(float dst, float radius, float scale) {
     if (dst >= radius) return 0.0f;
-    float scale = 15.0f / (powf(radius, 5.0f) * std::numbers::pi_v<float>);
     float v = radius - dst;
     return -v * scale;
 }
 
-__device__ float ViscositySmoothingKernel(float dst, float radius) {
+__device__ float ViscositySmoothingKernel(float dst, float radius, float scale) {
     if (dst >= radius) return 0.0f;
-    float scale = 315.0f / (64 * std::numbers::pi_v<float> * powf(abs(radius), 9.0f));
     float v = radius * radius - dst * dst;
     return v * v * v * scale;
 }
 
-__device__ float NearDensityKernel(float dst, float radius) {
+__device__ float NearDensityKernel(float dst, float radius, float scale) {
     if (dst >= radius) return 0.0f;
-    float scale = 15.0f / (std::numbers::pi_v<float> * powf(radius, 6.0f));
     float v = radius - dst;
     return v * v * v * scale;
 }
 
-__device__ float NearDensityDerivativeKernel(float dst, float radius) {
+__device__ float NearDensityDerivativeKernel(float dst, float radius, float scale) {
     if (dst >= radius) return 0.0f;
-    float scale = 45.0f / (powf(radius, 6.0f) * std::numbers::pi_v<float>);
     float v = radius - dst;
     return -v * v * scale;
 }
 
-__device__ float2 CalculateDensity(const float* positions, const uint32_t* spatialIndices, const uint32_t* spatialKeys, const uint32_t* startIndices, int numParticles, uint32_t hashTableSize, float3 samplePoint, float smoothingRadius) {
+__device__ float2 CalculateDensity(const float* positions, const uint32_t* spatialIndices, const uint32_t* spatialKeys,
+    const uint32_t* startIndices, int numParticles, uint32_t hashTableSize, float3 samplePoint, float smoothingRadius,
+    float smoothingScale, float nearDensityScale
+    ) {
     float density = 0.0f;
     float nearDensity = 0.0f;
     const float mass = 1.0f;
@@ -288,9 +286,9 @@ __device__ float2 CalculateDensity(const float* positions, const uint32_t* spati
 
                     if (sqrDst <= sqrRadius) {
                         float dst = sqrtf(sqrDst);
-                        float influence = SmoothingKernel(dst, smoothingRadius);
+                        float influence = SmoothingKernel(dst, smoothingRadius, smoothingScale);
                         density += mass * influence;
-                        nearDensity += mass * NearDensityKernel(dst, smoothingRadius);
+                        nearDensity += mass * NearDensityKernel(dst, smoothingRadius, nearDensityScale);
                     }
                 }
             }
@@ -301,7 +299,10 @@ __device__ float2 CalculateDensity(const float* positions, const uint32_t* spati
     return make_float2(density, nearDensity);
 }
 
-__device__ float3 CalculatePressureForce(int particleIndex, float* positions, float* densities, float* nearDensities, uint32_t* spatialIndices, uint32_t* spatialKeys, uint32_t* startIndices, int numParticles, uint32_t hashTableSize, float smoothingRadius, float targetDensity, float pressureMultiplier, float nearPressureMultiplier) {
+__device__ float3 CalculatePressureForce(int particleIndex, float* positions, float* densities, float* nearDensities,
+    uint32_t* spatialIndices, uint32_t* spatialKeys, uint32_t* startIndices, int numParticles, uint32_t hashTableSize,
+    float smoothingRadius, float targetDensity, float pressureMultiplier,
+    float nearPressureMultiplier, float smoothingDerivativeScale, float nearDerivativeScale) {
     float3 pressureForce = make_float3(0, 0, 0);
     const float mass = 1.0f;
 
@@ -327,7 +328,10 @@ __device__ float3 CalculatePressureForce(int particleIndex, float* positions, fl
                     if (particleIndex == otherParticleIndex) continue;
 
                     uint32_t otherIdx = otherParticleIndex * 3;
-                    float3 otherPos = make_float3(positions[otherIdx], positions[otherIdx + 1], positions[otherIdx + 2]);
+                    float px = __ldg(&positions[otherIdx]);
+                    float py = __ldg(&positions[otherIdx + 1]);
+                    float pz = __ldg(&positions[otherIdx + 2]);
+                    float3 otherPos = make_float3(px, py, pz);
 
                     int3 neighborCell = PositionToCellCoord(otherPos, smoothingRadius);
                     uint32_t neighborHash = HashCell(neighborCell.x, neighborCell.y, neighborCell.z);
@@ -339,13 +343,15 @@ __device__ float3 CalculatePressureForce(int particleIndex, float* positions, fl
                     float sqrDst = lengthSqr(offset);
 
                     if (sqrDst <= sqrRadius) {
-                        float dst = sqrtf(sqrDst);
-                        // float3 dir = dst == 0.0f ? GetRandomDir(particleIndex + otherParticleIndex) : offset / dst;
-                        float3 dir = dst == 0.0f ? make_float3(0, 0, 0) : offset / dst;
-                        float slope = SmoothingKernelDerivative(dst, smoothingRadius);
-                        float nearSlope = NearDensityDerivativeKernel(dst, smoothingRadius);
-                        float otherDensity = densities[otherParticleIndex];
-                        float otherNearDensity = nearDensities[otherParticleIndex];
+                        // float dst = sqrtf(sqrDst);
+                        // float3 dir = dst == 0.0f ? make_float3(0, 0, 0) : offset / dst;
+                        float invDst = rsqrt(sqrDst);
+                        float dst = sqrDst * invDst;
+                        float3 dir = (sqrDst > 1e-10f) ? (offset * invDst) : make_float3(0, 0, 0);
+                        float slope = SmoothingKernelDerivative(dst, smoothingRadius, smoothingDerivativeScale);
+                        float nearSlope = NearDensityDerivativeKernel(dst, smoothingRadius, nearDerivativeScale);
+                        float otherDensity = __ldg(&densities[otherParticleIndex]);
+                        float otherNearDensity = __ldg(&nearDensities[otherParticleIndex]);
                         float2 sharedPressure = CalculateSharedPressure(density, nearDensity, otherDensity, otherNearDensity, targetDensity, pressureMultiplier, nearPressureMultiplier);
 
                         // float combinedForce = (sharedPressure.x * slope) + (sharedPressure.y * nearSlope);
@@ -363,7 +369,7 @@ __device__ float3 CalculatePressureForce(int particleIndex, float* positions, fl
 
 __device__ float3 CalculateViscosityForce(int particleIndex, float* positions, float* velocities,
     uint32_t* spatialIndices, uint32_t* spatialKeys, uint32_t* startIndices,
-    int numParticles, uint32_t hashTableSize, float smoothingRadius, float viscosityStrength) {
+    int numParticles, uint32_t hashTableSize, float smoothingRadius, float viscosityStrength, float viscosityScale) {
     float3 viscosityForce = make_float3(0, 0, 0);
     int currentIdx = particleIndex * 3;
 
@@ -400,7 +406,7 @@ __device__ float3 CalculateViscosityForce(int particleIndex, float* positions, f
 
                     if (sqrDst <= sqrRadius) {
                         float dst = sqrtf(sqrDst);
-                        float influence = ViscositySmoothingKernel(dst, smoothingRadius);
+                        float influence = ViscositySmoothingKernel(dst, smoothingRadius, viscosityScale);
 
                         viscosityForce += (otherVel - velocity) * influence;
                     }
@@ -446,16 +452,109 @@ __device__ void ResolveCollisions(float* positions, float* velocities, int numPa
     velocities[idx + 2] = velocityLocal.z;
 }
 
+__device__ float3 CalculateCombinedForces(
+    int particleIndex,
+    float* positions,
+    float* velocities,
+    float* densities,
+    float* nearDensities,
+    uint32_t* spatialIndices,
+    uint32_t* spatialKeys,
+    uint32_t* startIndices,
+    int numParticles,
+    uint32_t hashTableSize,
+    float smoothingRadius,
+    float targetDensity,
+    float pressureMultiplier,
+    float nearPressureMultiplier,
+    float viscosityStrength,
+    float smoothingDerivativeScale,
+    float nearDerivativeScale,
+    float viscosityScale
+) {
+    float3 totalForce = make_float3(0, 0, 0);
+    const float mass = 1.0f;
+
+    int currentIdx = particleIndex * 3;
+    float3 samplePoint = make_float3(positions[currentIdx], positions[currentIdx + 1], positions[currentIdx + 2]);
+    float3 velocity = make_float3(velocities[currentIdx], velocities[currentIdx + 1], velocities[currentIdx + 2]);
+
+    float density = densities[particleIndex];
+    float nearDensity = nearDensities[particleIndex];
+
+    int3 center = PositionToCellCoord(samplePoint, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+
+    for (int offsetX = -1; offsetX <= 1; offsetX++) {
+        for (int offsetY = -1; offsetY <= 1; offsetY++) {
+            for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
+                int3 cellCoord = make_int3(center.x + offsetX, center.y + offsetY, center.z + offsetZ);
+                uint32_t key = GetKeyFromHash(HashCell(cellCoord.x, cellCoord.y, cellCoord.z), hashTableSize);
+                uint32_t startIndex = startIndices[key];
+
+                for (uint32_t i = startIndex; i < numParticles; i++) {
+                    if (spatialKeys[i] != key) break;
+
+                    uint32_t otherParticleIndex = spatialIndices[i];
+                    if (particleIndex == otherParticleIndex) continue;
+
+                    uint32_t otherIdx = otherParticleIndex * 3;
+
+                    // Load position once for both calculations
+                    float px = __ldg(&positions[otherIdx]);
+                    float py = __ldg(&positions[otherIdx + 1]);
+                    float pz = __ldg(&positions[otherIdx + 2]);
+                    float3 otherPos = make_float3(px, py, pz);
+
+                    float3 offset = otherPos - samplePoint;
+                    float sqrDst = lengthSqr(offset);
+
+                    if (sqrDst <= sqrRadius) {
+                        float invDst = rsqrt(sqrDst);
+                        float dst = sqrDst * invDst;
+
+                        float3 dir = (sqrDst > 1e-10f) ? (offset * invDst) : make_float3(0, 0, 0);
+                        float slope = SmoothingKernelDerivative(dst, smoothingRadius, smoothingDerivativeScale);
+                        float nearSlope = NearDensityDerivativeKernel(dst, smoothingRadius, nearDerivativeScale);
+
+                        float otherDensity = __ldg(&densities[otherParticleIndex]);
+                        float otherNearDensity = __ldg(&nearDensities[otherParticleIndex]);
+
+                        float2 sharedPressure = CalculateSharedPressure(density, nearDensity, otherDensity, otherNearDensity, targetDensity, pressureMultiplier, nearPressureMultiplier);
+
+                        totalForce += dir * sharedPressure.x * slope * mass / otherDensity;
+                        totalForce += dir * sharedPressure.y * nearSlope * mass / otherDensity;
+
+                        // Only load velocity if we are actually inside the radius
+                        float vx = __ldg(&velocities[otherIdx]);
+                        float vy = __ldg(&velocities[otherIdx + 1]);
+                        float vz = __ldg(&velocities[otherIdx + 2]);
+                        float3 otherVel = make_float3(vx, vy, vz);
+
+                        float influence = ViscositySmoothingKernel(dst, smoothingRadius, viscosityScale);
+                        totalForce += (otherVel - velocity) * influence * viscosityStrength;
+                    }
+                }
+            }
+        }
+    }
+
+    return totalForce;
+}
+
 __global__ void ApplyPressureForces(float* positions, float* velocities, float* densities, float* nearDensities, uint32_t* spatialIndices,
     uint32_t* spatialKeys, uint32_t* startIndices, int numParticles, uint32_t hashTableSize, float smoothingRadius,
-    float targetDensity, float pressureMultiplier, float nearPressureMultiplier, float viscosityStrength, float dt) {
+    float targetDensity, float pressureMultiplier, float nearPressureMultiplier, float viscosityStrength, float dt,
+    float smoothingDerivativeScale, float viscosityScale, float nearDerivativeScale
+    ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numParticles) return;
 
-    float3 pressureForce = CalculatePressureForce(i, positions, densities, nearDensities, spatialIndices, spatialKeys, startIndices, numParticles, hashTableSize, smoothingRadius, targetDensity, pressureMultiplier, nearPressureMultiplier);
-    float3 viscosityForce = CalculateViscosityForce(i, positions, velocities, spatialIndices, spatialKeys, startIndices, numParticles, hashTableSize, smoothingRadius, viscosityStrength);
-
-    float3 totalForce = pressureForce + viscosityForce;
+    float3 totalForce = CalculateCombinedForces(
+        i, positions, velocities, densities, nearDensities, spatialIndices, spatialKeys, startIndices,
+        numParticles, hashTableSize, smoothingRadius, targetDensity, pressureMultiplier,
+        nearPressureMultiplier, viscosityStrength, smoothingDerivativeScale, nearDerivativeScale, viscosityScale
+    );
     float density = max(densities[i], 0.0001f);
     float3 acceleration = totalForce / density;
 
@@ -703,14 +802,16 @@ __global__ void PredictPositions(float* positions, float* predictedPositions, fl
     // predictedPositions[idx + 2] = positions[idx + 2] + velocities[idx + 2] * 1 / 120.0f;
 }
 
-__global__ void UpdateDensities(float* positions, float* velocities, float* densities, float* nearDensities, uint32_t* spatialIndices, uint32_t* spatialKeys, uint32_t* startIndices, int numParticles, uint32_t hashTableSize, float smoothingRadius, float gravity, float dt) {
+__global__ void UpdateDensities(float* positions, float* velocities, float* densities, float* nearDensities,
+    uint32_t* spatialIndices, uint32_t* spatialKeys, uint32_t* startIndices, int numParticles, uint32_t hashTableSize,
+    float smoothingRadius, float gravity, float dt, float smoothingScale, float nearDensityScale) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numParticles) return;
 
     int idx = i * 3;
 
     float3 samplePoint  = make_float3(positions[idx], positions[idx + 1], positions[idx + 2]);
-    float2 result = CalculateDensity(positions, spatialIndices, spatialKeys, startIndices, numParticles, hashTableSize, samplePoint, smoothingRadius);
+    float2 result = CalculateDensity(positions, spatialIndices, spatialKeys, startIndices, numParticles, hashTableSize, samplePoint, smoothingRadius, smoothingScale, nearDensityScale);
     densities[i] = result.x;
     nearDensities[i] = result.y;
 }
@@ -811,6 +912,18 @@ void SPHSolver::init(const std::vector<float> &positions, const std::vector<floa
     size_t copySize = m_numParticles * 3 * sizeof(float);
     cudaMemcpy(d_positions, positions.data(), copySize, cudaMemcpyHostToDevice);
     cudaMemcpy(d_velocities, velocities.data(), copySize, cudaMemcpyHostToDevice);
+
+    float h = m_params.smoothingRadius;
+    float h5 = powf(h, 5.0f);
+    float h6 = powf(h, 6.0f);
+    float h9 = powf(h, 9.0f);
+    float pi = std::numbers::pi_v<float>;
+
+    m_params.densityScale = 15.0f / (2.0f * pi * h5);
+    m_params.pressureScale = 15.0f / (pi * h5);
+    m_params.viscosityScale = 315.0f / (64.0f * pi * h9);
+    m_params.nearDensityScale = 15.0f / (pi * h6);
+    m_params.nearPressureScale = 45.0f / (pi * h6);
 }
 
 void SPHSolver::update(float dt) {
@@ -820,30 +933,30 @@ void SPHSolver::update(float dt) {
     // Apply gravity and predict next positions
     PredictPositions<<<numBlock, blockSize>>>(d_positions, d_predictedPositions, d_velocities,
         m_numParticles, m_params.gravity, dt);
-    cudaDeviceSynchronize();
+    // cudaDeviceSynchronize();
 
     UpdateSpatialLookup();
 
     // Calculate and apply densities
     UpdateDensities<<<numBlock, blockSize>>>(d_predictedPositions, d_velocities, d_densities, d_nearDensities,
         d_spatialIndices, d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
-        m_params.smoothingRadius, m_params.gravity, dt);
-    cudaDeviceSynchronize();
+        m_params.smoothingRadius, m_params.gravity, dt, m_params.densityScale, m_params.nearDensityScale);
+    // cudaDeviceSynchronize();
 
     // Calculate and apply pressure forces
     ApplyPressureForces<<<numBlock, blockSize>>>(d_predictedPositions, d_velocities, d_densities, d_nearDensities,
         d_spatialIndices, d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
-        m_params.smoothingRadius, m_params.targetDensity, m_params.pressureMultiplier, m_params.nearPressureMultiplier, m_params.viscosityStrength, dt);
-    cudaDeviceSynchronize();
+        m_params.smoothingRadius, m_params.targetDensity, m_params.pressureMultiplier, m_params.nearPressureMultiplier, m_params.viscosityStrength, dt, m_params.pressureScale, m_params.viscosityScale, m_params.nearPressureScale);
+    // cudaDeviceSynchronize();
 
     // Update positions and handle collisions
     UpdatePositions<<<numBlock, blockSize>>>(d_positions, d_velocities, m_numParticles,
         m_params.particleSize, m_params.boundsX, m_params.boundsY, m_params.boundsZ,
         m_params.collisionDamping, m_params.gravity, dt, d_colliders, m_numColliders, m_params.smoothingRadius, m_params.colliderDragMultiplier);
-    cudaDeviceSynchronize();
+    // cudaDeviceSynchronize();
 
     IntegrateColliders<<<1, 32>>>(d_colliders, m_numColliders, m_params.boundsX, m_params.boundsY, m_params.boundsZ, m_params.gravity, dt);
-    cudaDeviceSynchronize();
+    // cudaDeviceSynchronize();
 
     ResolveColliderCollisions<<<1, m_numColliders>>>(d_colliders, m_numColliders);
     cudaDeviceSynchronize();
@@ -862,12 +975,8 @@ void SPHSolver::getColliders(std::vector<Collider> &outColliders) {
     cudaMemcpy(outColliders.data(), d_colliders, m_numColliders * sizeof(Collider), cudaMemcpyDeviceToHost);
 }
 
-void SPHSolver::getPositions(std::vector<float> &outPositions) {
-    if (outPositions.size() != m_numParticles * 3) {
-        outPositions.resize(m_numParticles * 3);
-    }
-    // TODO: Find a way to eliminate the transfer to CPU memory for rendering
-    cudaMemcpy(outPositions.data(), d_positions, m_numParticles * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+void SPHSolver::getPositions(float* outPositions) {
+    cudaMemcpy(outPositions, d_positions, m_numParticles * 3 * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
 void SPHSolver::setParams(const SPHParams &params) {
