@@ -98,7 +98,7 @@ private:
     bgfx::IndexBufferHandle m_cubeIB;
 
     // SPH particle data
-    std::vector<float> m_particlePositions;
+    float* m_particlePositions = nullptr;
     std::vector<uint32_t> m_particleColors;
     float m_particleRadius = 0.1f;
 
@@ -111,6 +111,12 @@ AnitoWave::AnitoWave(const Config &config) : m_config(config), m_width(config.wi
 
 AnitoWave::~AnitoWave() {
     delete m_solver;
+
+    if (m_particlePositions) {
+        cudaFreeHost(m_particlePositions);
+        m_particlePositions = nullptr;
+    }
+
     if (m_window) {
         bgfx::shutdown();
         glfwTerminate();
@@ -156,7 +162,14 @@ void AnitoWave::initParticleRendering() {
     float startY = -((particlesPerSide - 1) * spacing) / 2.0f;
     float startZ = -((particlesPerSide - 1) * spacing) / 2.0f;
 
-    m_particlePositions.reserve(numParticles * 3);
+    size_t dataSize = numParticles * 3 * sizeof(float);
+    cudaMallocHost((void**)&m_particlePositions, dataSize);
+
+    if (!m_particlePositions) {
+        fprintf(stderr, "Failed to allocate pinned memory.\n");
+        return;
+    }
+
     m_particleColors.reserve(numParticles);
 
     for (int z = 0; z < particlesPerSide; ++z) {
@@ -166,9 +179,10 @@ void AnitoWave::initParticleRendering() {
                 float py = startY + y * spacing;
                 float pz = startZ + z * spacing;
 
-                m_particlePositions.push_back(px);
-                m_particlePositions.push_back(py);
-                m_particlePositions.push_back(pz);
+                int index = (z * particlesPerSide * particlesPerSide + y * particlesPerSide + x) * 3;
+                m_particlePositions[index + 0] = px;
+                m_particlePositions[index + 1] = py;
+                m_particlePositions[index + 2] = pz;
 
                 m_particleColors.push_back(0xffff0000);
             }
@@ -185,7 +199,8 @@ void AnitoWave::initParticleRendering() {
 
     m_particleRadiusUniform = bgfx::createUniform("u_particleRadius", bgfx::UniformType::Vec4);
 
-    m_solver->init(m_particlePositions, initVelocities);
+    std::vector tempPos(m_particlePositions, m_particlePositions + numParticles * 3);
+    m_solver->init(tempPos, initVelocities);
 
     initColliderRendering();
 
@@ -208,8 +223,28 @@ void AnitoWave::initParticleRendering() {
     sphere2.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
     sphere2.dims = make_float3(0.6f, 0.0f, 0.0f); // dims.x is radius
 
+    Collider sphere3{};
+    sphere3.type = TYPE_SPHERE;
+    sphere3.isDynamic = true;
+    sphere3.mass = 2050.0f;
+    sphere3.position = make_float3(-5.5f, 0.0f, 2.0f);
+    sphere3.velocity = make_float3(0.0f, 0.0f, 0.0f);
+    sphere3.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
+    sphere3.dims = make_float3(0.8f, 0.0f, 0.0f); // dims.x is radius
+
+    // Collider box1{};
+    // box1.type = TYPE_BOX;
+    // box1.isDynamic = true;
+    // box1.mass = 2050.0f;
+    // box1.position = make_float3(5.5f, 0.0f, 2.0f);
+    // box1.velocity = make_float3(0.0f, 0.0f, 0.0f);
+    // box1.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
+    // box1.dims = make_float3(0.6f, 0.3f, 0.6f); // dims.x is radius
+
     m_solver->addCollider(sphere1);
     m_solver->addCollider(sphere2);
+    m_solver->addCollider(sphere3);
+    // m_solver->addCollider(box1);
 
     m_particleRadius = m_solver->getParams().particleSize;
 }
@@ -310,7 +345,7 @@ void AnitoWave::updateCamera() {
 }
 
 void AnitoWave::renderParticles() {
-    const size_t numParticles = m_particlePositions.size() / 3;
+    const size_t numParticles = m_solver->getNumParticles();
     if (numParticles == 0) return;
 
     std::vector<ParticleInstance> instances;
@@ -536,7 +571,7 @@ void AnitoWave::run() {
     double accumulator = 0.0f;
 
     const float FIXED_DT = 1.0f / 120.0f;
-    const int MAX_STEPS_PER_FRAME = 5;
+    const int MAX_STEPS_PER_FRAME = 3;
 
     while (!glfwWindowShouldClose(m_window)) {
         glfwPollEvents();

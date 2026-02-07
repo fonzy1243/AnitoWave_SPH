@@ -29,6 +29,12 @@ struct SPHParams {
     float viscosityStrength = 0.1f;
     float nearPressureMultiplier = 0.1f;
     float colliderDragMultiplier = 0.001f;
+
+    float densityScale;        // For SmoothingKernel
+    float pressureScale;       // For SmoothingKernelDerivative
+    float viscosityScale;      // For ViscositySmoothingKernel
+    float nearDensityScale;    // For NearDensityKernel
+    float nearPressureScale;   // For NearDensityDerivativeKernel
 };
 
 class SPHSolver {
@@ -45,7 +51,9 @@ public:
     SPHParams& getParams() { return m_params; }
     void getColliders(std::vector<Collider>& outColliders);
 
-    void getPositions(std::vector<float>& outPositions);
+    void getPositions(float* outPositions);
+
+    int getNumParticles() const { return m_numParticles; }
 
 private:
     int m_numParticles;
