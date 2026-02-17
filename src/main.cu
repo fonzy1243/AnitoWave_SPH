@@ -146,7 +146,7 @@ void AnitoWave::initParticleRendering() {
         BGFX_BUFFER_INDEX32
     );
 
-    int particlesPerSide = 50;
+    int particlesPerSide = 80;
     int numParticles = particlesPerSide * particlesPerSide * particlesPerSide;
 
     float boundsX = 10.0f;
@@ -548,6 +548,8 @@ bool AnitoWave::init() {
     init.resolution.width = m_config.width;
     init.resolution.height = m_config.height;
     init.resolution.reset = m_config.vsync ? BGFX_RESET_VSYNC : BGFX_RESET_NONE;
+    init.limits.maxTransientVbSize = 32 * 1024 * 1024;
+    init.limits.maxTransientIbSize = 32 * 1024 * 1024;
     if (!bgfx::init(init)) {
         fprintf(stderr, "Failed to initialize bgfx\n");
         glfwDestroyWindow(m_window);
@@ -611,6 +613,8 @@ void AnitoWave::run() {
         }
 
         m_solver->getPositions(m_particlePositions);
+
+        cudaStreamSynchronize(0);
 
         renderParticles();
         renderColliders();

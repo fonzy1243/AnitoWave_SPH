@@ -191,11 +191,20 @@ __device__ int3 PositionToCellCoord(float3 point, float radius) {
     return make_int3(cellX, cellY, cellZ);
 }
 
+__device__ uint32_t expandBits(uint32_t v) {
+    v = (v * 0x00010001u) & 0xFF0000FFu;
+    v = (v * 0x00000101u) & 0x0F00F00Fu;
+    v = (v * 0x00000011u) & 0xC30C30C3u;
+    v = (v * 0x00000005u) & 0x49249249u;
+    return v;
+}
+
 __device__ uint32_t HashCell(int cellX, int cellY, int cellZ) {
-    uint32_t a = (uint32_t)cellX * 15823;
-    uint32_t b = (uint32_t)cellY * 9737333;
-    uint32_t c = (uint32_t)cellZ * 440817757;
-    return a + b + c;
+    // uint32_t a = (uint32_t)cellX * 15823;
+    // uint32_t b = (uint32_t)cellY * 9737333;
+    // uint32_t c = (uint32_t)cellZ * 440817757;
+    // return a + b + c;
+    return expandBits(cellX) | (expandBits(cellY) << 1) | (expandBits(cellZ) << 2);
 }
 
 __device__ uint32_t GetKeyFromHash(uint32_t hash, uint32_t hashTableSize) {
@@ -1206,7 +1215,6 @@ void SPHSolver::update(float dt) {
     UpdateSpatialLookup();
 
     SortData<<<numBlock, blockSize>>>(m_numParticles, d_spatialIndices, d_predictedPositions, d_sortedPredictedPositions, d_velocities, d_sortedVelocities);
-    cudaDeviceSynchronize();
 
     // Calculate and apply densities
     size_t smemDensity = blockSize * sizeof(float3);
@@ -1268,7 +1276,8 @@ void SPHSolver::getColliders(std::vector<Collider> &outColliders) {
 }
 
 void SPHSolver::getPositions(float* outPositions) {
-    cudaMemcpy(outPositions, d_positions, m_numParticles * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaMemcpy(outPositions, d_positions, m_numParticles * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(outPositions, d_positions, m_numParticles * 3 * sizeof(float), cudaMemcpyHostToDevice);
 }
 
 void SPHSolver::setParams(const SPHParams &params) {
