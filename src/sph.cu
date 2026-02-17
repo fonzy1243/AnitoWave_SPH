@@ -564,6 +564,153 @@ __global__ void ApplyPressureForces(float* positions, float* velocities, float* 
     velocities[idx + 2] += acceleration.z * dt;
 }
 
+__global__ void ApplyPressureForces_Shared(
+    float* predictedPositions, // Sorted
+    float* velocities,         // Sorted
+    float* densities,          // Sorted
+    float* nearDensities,      // Sorted
+    uint32_t* spatialIndices, uint32_t* spatialKeys, uint32_t* startIndices,
+    int numParticles, uint32_t hashTableSize,
+    float smoothingRadius, float targetDensity,
+    float pressureMultiplier, float nearPressureMultiplier,
+    float viscosityStrength, float dt,
+    float smoothingDerivativeScale, float viscosityScale, float nearDerivativeScale
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= numParticles) return;
+
+    int idx = i * 3;
+    float3 samplePos = make_float3(predictedPositions[idx], predictedPositions[idx+1], predictedPositions[idx+2]);
+    float3 myVel = make_float3(velocities[idx], velocities[idx+1], velocities[idx+2]);
+    float myDensity = densities[i];
+    float myNearDensity = nearDensities[i];
+
+    // Shared Memory Setup: SoA layout
+    extern __shared__ float s_data[];
+    int BS = blockDim.x;
+    float* s_posX = s_data;
+    float* s_posY = s_posX + BS;
+    float* s_posZ = s_posY + BS;
+    float* s_velX = s_posZ + BS;
+    float* s_velY = s_velX + BS;
+    float* s_velZ = s_velY + BS;
+    float* s_den  = s_velZ + BS;
+    float* s_nden = s_den  + BS;
+
+    s_posX[threadIdx.x] = samplePos.x;
+    s_posY[threadIdx.x] = samplePos.y;
+    s_posZ[threadIdx.x] = samplePos.z;
+    s_velX[threadIdx.x] = myVel.x;
+    s_velY[threadIdx.x] = myVel.y;
+    s_velZ[threadIdx.x] = myVel.z;
+    s_den[threadIdx.x]  = myDensity;
+    s_nden[threadIdx.x] = myNearDensity;
+
+    __syncthreads();
+
+    float3 pressureForce = make_float3(0, 0, 0);
+    float3 viscosityForce = make_float3(0, 0, 0);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+    const float mass = 1.0f;
+
+    // PHASE 1: Shared Memory
+    #pragma unroll
+    for (int j = 0; j < blockDim.x; j++) {
+        if ((blockIdx.x * blockDim.x + j) >= numParticles) break;
+        if (i == (blockIdx.x * blockDim.x + j)) continue;
+
+        float3 otherPos = make_float3(s_posX[j], s_posY[j], s_posZ[j]);
+        float3 offset = otherPos - samplePos;
+        float sqrDst = lengthSqr(offset);
+
+        if (sqrDst <= sqrRadius) {
+            float invDst = rsqrtf(sqrDst);
+            float dst = sqrDst * invDst;
+            float3 dir = (sqrDst > 1e-10f) ? (offset * invDst) : make_float3(0, 0, 0);
+
+            float otherDensity = s_den[j];
+            float otherNearDensity = s_nden[j];
+            float3 otherVel = make_float3(s_velX[j], s_velY[j], s_velZ[j]);
+
+            // Pressure
+            float slope = SmoothingKernelDerivative(dst, smoothingRadius, smoothingDerivativeScale);
+            float nearSlope = NearDensityDerivativeKernel(dst, smoothingRadius, nearDerivativeScale);
+            float2 sharedPressure = CalculateSharedPressure(myDensity, myNearDensity, otherDensity, otherNearDensity, targetDensity, pressureMultiplier, nearPressureMultiplier);
+
+            pressureForce += dir * sharedPressure.x * slope * mass / otherDensity;
+            pressureForce += dir * sharedPressure.y * nearSlope * mass / otherDensity;
+
+            // Viscosity
+            float influence = ViscositySmoothingKernel(dst, smoothingRadius, viscosityScale);
+            viscosityForce += (otherVel - myVel) * influence;
+        }
+    }
+
+    // PHASE 2: Global Memory
+    int3 center = PositionToCellCoord(samplePos, smoothingRadius);
+    uint32_t blockStart = blockIdx.x * blockDim.x;
+    uint32_t blockEnd   = blockStart + blockDim.x;
+
+    for (int offsetX = -1; offsetX <= 1; offsetX++) {
+        for (int offsetY = -1; offsetY <= 1; offsetY++) {
+            for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
+                int3 cellCoord = make_int3(center.x + offsetX, center.y + offsetY, center.z + offsetZ);
+                uint32_t hash = HashCell(cellCoord.x, cellCoord.y, cellCoord.z);
+                uint32_t key = GetKeyFromHash(hash, hashTableSize);
+                uint32_t startIndex = startIndices[key];
+
+                if (startIndex == 0xffffffff) continue;
+
+                for (uint32_t j = startIndex; j < numParticles; j++) {
+                    if (spatialKeys[j] != key) break;
+                    if (j >= blockStart && j < blockEnd) continue; // Skip shared mem
+                    if (i == j) continue;
+
+                    int otherIdx = j * 3;
+                    float px = __ldg(&predictedPositions[otherIdx]);
+                    float py = __ldg(&predictedPositions[otherIdx + 1]);
+                    float pz = __ldg(&predictedPositions[otherIdx + 2]);
+                    float3 otherPos = make_float3(px, py, pz);
+
+                    float sqrDst = lengthSqr(otherPos - samplePos);
+
+                    if (sqrDst <= sqrRadius) {
+                        float invDst = rsqrtf(sqrDst);
+                        float dst = sqrDst * invDst;
+                        float3 offset = otherPos - samplePos;
+                        float3 dir = (sqrDst > 1e-10f) ? (offset * invDst) : make_float3(0, 0, 0);
+
+                        float otherDensity = __ldg(&densities[j]);
+                        float otherNearDensity = __ldg(&nearDensities[j]);
+
+                        float vx = __ldg(&velocities[otherIdx]);
+                        float vy = __ldg(&velocities[otherIdx + 1]);
+                        float vz = __ldg(&velocities[otherIdx + 2]);
+                        float3 otherVel = make_float3(vx, vy, vz);
+
+                        float slope = SmoothingKernelDerivative(dst, smoothingRadius, smoothingDerivativeScale);
+                        float nearSlope = NearDensityDerivativeKernel(dst, smoothingRadius, nearDerivativeScale);
+                        float2 sharedPressure = CalculateSharedPressure(myDensity, myNearDensity, otherDensity, otherNearDensity, targetDensity, pressureMultiplier, nearPressureMultiplier);
+
+                        pressureForce += dir * sharedPressure.x * slope * mass / otherDensity;
+                        pressureForce += dir * sharedPressure.y * nearSlope * mass / otherDensity;
+
+                        float influence = ViscositySmoothingKernel(dst, smoothingRadius, viscosityScale);
+                        viscosityForce += (otherVel - myVel) * influence;
+                    }
+                }
+            }
+        }
+    }
+
+    float3 totalForce = pressureForce + (viscosityForce * viscosityStrength);
+    float3 acceleration = totalForce / max(myDensity, 0.0001f);
+
+    velocities[idx] += acceleration.x * dt;
+    velocities[idx + 1] += acceleration.y * dt;
+    velocities[idx + 2] += acceleration.z * dt;
+}
+
 __global__ void UpdatePositions(float* positions, float* velocities, int numParticles, float particleSize, float boundsX, float boundsY, float boundsZ,
     float collisionDamping, float gravity, float dt, Collider* colliders, int numColliders, float smoothingRadius, float colliderDragModifier) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -816,6 +963,85 @@ __global__ void UpdateDensities(float* positions, float* velocities, float* dens
     nearDensities[i] = result.y;
 }
 
+__global__ void UpdateDensities_Shared(
+    float* positions, // SORTED
+    uint32_t* spatialIndices,
+    uint32_t* spatialKeys,
+    uint32_t* startIndices,
+    int numParticles,
+    uint32_t hashTableSize,
+    float smoothingRadius,
+    float smoothingScale,
+    float nearDensityScale,
+    float* densities,
+    float* nearDensities
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= numParticles) return;
+
+    int idx = i * 3;
+    float3 myPos = make_float3(positions[idx], positions[idx+1], positions[idx+2]);
+
+    extern __shared__ float3 s_pos[];
+    s_pos[threadIdx.x] = myPos;
+    __syncthreads();
+
+    float density = 0.0f;
+    float nearDensity = 0.0f;
+    float sqrRadius = smoothingRadius * smoothingRadius;
+    const float mass = 1.0f;
+
+    #pragma unroll
+    for (int j = 0; j < blockDim.x; j++) {
+        if ((blockIdx.x * blockDim.x + j) >= numParticles) break;
+        float3 sPos = s_pos[j];
+        float sqrDst = lengthSqr(sPos - myPos);
+        if (sqrDst <= sqrRadius) {
+            float dst = sqrtf(sqrDst);
+            density += mass * SmoothingKernel(dst, smoothingRadius, smoothingScale);
+            nearDensity += mass * NearDensityKernel(dst, smoothingRadius, nearDensityScale);
+        }
+    }
+
+    int3 center = PositionToCellCoord(myPos, smoothingRadius);
+    uint32_t blockStart = blockIdx.x * blockDim.x;
+    uint32_t blockEnd   = blockStart + blockDim.x;
+
+    for (int offsetX = -1; offsetX <= 1; offsetX++) {
+        for (int offsetY = -1; offsetY <= 1; offsetY++) {
+            for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
+                int3 cellCoord = make_int3(center.x + offsetX, center.y + offsetY, center.z + offsetZ);
+                uint32_t hash = HashCell(cellCoord.x, cellCoord.y, cellCoord.z);
+                uint32_t key = GetKeyFromHash(hash, hashTableSize);
+                uint32_t startIndex = startIndices[key];
+
+                if (startIndex == 0xffffffff) continue;
+
+                for (uint32_t j = startIndex; j < numParticles; j++) {
+                    if (spatialKeys[j] != key) break;
+                    if (j >= blockStart && j < blockEnd) continue; // Skip shared mem
+
+                    int oIdx = j * 3;
+                    float px = __ldg(&positions[oIdx]);
+                    float py = __ldg(&positions[oIdx + 1]);
+                    float pz = __ldg(&positions[oIdx + 2]);
+                    float3 otherPos = make_float3(px, py, pz);
+
+                    float sqrDst = lengthSqr(otherPos - myPos);
+                    if (sqrDst <= sqrRadius) {
+                        float dst = sqrtf(sqrDst);
+                        density += mass * SmoothingKernel(dst, smoothingRadius, smoothingScale);
+                        nearDensity += mass * NearDensityKernel(dst, smoothingRadius, nearDensityScale);
+                    }
+                }
+            }
+        }
+    }
+
+    densities[i] = density;
+    nearDensities[i] = nearDensity;
+}
+
 __global__ void UpdateSpatialHash(float* positions, int numParticles, uint32_t hashTableSize, float radius, uint32_t* spatialIndices, uint32_t* spatialKeys, uint32_t* startIndices) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numParticles) return;
@@ -841,6 +1067,46 @@ __global__ void UpdateStartIndices(uint32_t* spatialKeys, uint32_t* startIndices
     if (key != keyPrev) {
         startIndices[key] = i;
     }
+}
+
+__global__ void SortData(
+    int numParticles,
+    uint32_t* spatialIndices,
+    float* positions, float* sortedPositions,
+    float* velocities, float* sortedVelocities
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= numParticles) return;
+
+    int originalIndex = spatialIndices[i];
+    int idx = i * 3;
+    int originalIdx = originalIndex * 3;
+
+    sortedPositions[idx] = positions[originalIdx];
+    sortedPositions[idx + 1] = positions[originalIdx + 1];
+    sortedPositions[idx + 2] = positions[originalIdx + 2];
+
+    sortedVelocities[idx] = velocities[originalIdx];
+    sortedVelocities[idx + 1] = velocities[originalIdx + 1];
+    sortedVelocities[idx + 2] = velocities[originalIdx + 2];
+}
+
+__global__ void ReorderVelocities(
+    int numParticles,
+    uint32_t* spatialIndices,
+    float* sortedVelocities,
+    float* originalVelocities
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= numParticles) return;
+
+    int originalIndex = spatialIndices[i];
+    int idx = i * 3;
+    int originalIdx = originalIndex * 3;
+
+    originalVelocities[originalIdx] = sortedVelocities[idx];
+    originalVelocities[originalIdx + 1] = sortedVelocities[idx + 1];
+    originalVelocities[originalIdx + 2] = sortedVelocities[idx + 2];
 }
 
 // Pseudocode for using the spatial hashing
@@ -891,7 +1157,9 @@ SPHSolver::SPHSolver(int maxParticles) : m_maxParticles(maxParticles), m_numPart
     size_t size = m_maxParticles * 3 * sizeof(float);
     cudaMalloc(&d_positions, size);
     cudaMalloc(&d_predictedPositions, size);
+    cudaMalloc(&d_sortedPredictedPositions, size);
     cudaMalloc(&d_velocities, size);
+    cudaMalloc(&d_sortedVelocities, size);
     cudaMalloc(&d_densities, m_maxParticles * sizeof(float));
     cudaMalloc(&d_nearDensities, m_maxParticles * sizeof(float));
     cudaMalloc(&d_spatialIndices, m_maxParticles * sizeof(uint32_t));
@@ -937,17 +1205,41 @@ void SPHSolver::update(float dt) {
 
     UpdateSpatialLookup();
 
+    SortData<<<numBlock, blockSize>>>(m_numParticles, d_spatialIndices, d_predictedPositions, d_sortedPredictedPositions, d_velocities, d_sortedVelocities);
+    cudaDeviceSynchronize();
+
     // Calculate and apply densities
-    UpdateDensities<<<numBlock, blockSize>>>(d_predictedPositions, d_velocities, d_densities, d_nearDensities,
-        d_spatialIndices, d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
-        m_params.smoothingRadius, m_params.gravity, dt, m_params.densityScale, m_params.nearDensityScale);
+    size_t smemDensity = blockSize * sizeof(float3);
+    // UpdateDensities<<<numBlock, blockSize>>>(d_predictedPositions, d_velocities, d_densities, d_nearDensities,
+    //     d_spatialIndices, d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
+    //     m_params.smoothingRadius, m_params.gravity, dt, m_params.densityScale, m_params.nearDensityScale);
+    UpdateDensities_Shared<<<numBlock, blockSize, smemDensity>>>(
+         d_sortedPredictedPositions,
+         d_spatialIndices, d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
+         m_params.smoothingRadius, m_params.densityScale, m_params.nearDensityScale,
+         d_densities, d_nearDensities
+     );
     // cudaDeviceSynchronize();
 
     // Calculate and apply pressure forces
-    ApplyPressureForces<<<numBlock, blockSize>>>(d_predictedPositions, d_velocities, d_densities, d_nearDensities,
+    // ApplyPressureForces<<<numBlock, blockSize>>>(d_predictedPositions, d_velocities, d_densities, d_nearDensities,
+    //     d_spatialIndices, d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
+    //     m_params.smoothingRadius, m_params.targetDensity, m_params.pressureMultiplier, m_params.nearPressureMultiplier, m_params.viscosityStrength, dt, m_params.pressureScale, m_params.viscosityScale, m_params.nearPressureScale);
+    size_t smemPressure = blockSize * 8 * sizeof(float);
+    ApplyPressureForces_Shared<<<numBlock, blockSize, smemPressure>>>(
+        d_sortedPredictedPositions, // Sorted
+        d_sortedVelocities,         // Sorted (This gets updated!)
+        d_densities,                // Calculated from sorted data (matches index)
+        d_nearDensities,            // Calculated from sorted data (matches index)
         d_spatialIndices, d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
-        m_params.smoothingRadius, m_params.targetDensity, m_params.pressureMultiplier, m_params.nearPressureMultiplier, m_params.viscosityStrength, dt, m_params.pressureScale, m_params.viscosityScale, m_params.nearPressureScale);
+        m_params.smoothingRadius, m_params.targetDensity, m_params.pressureMultiplier,
+        m_params.nearPressureMultiplier, m_params.viscosityStrength, dt,
+        m_params.pressureScale, m_params.viscosityScale, m_params.nearPressureScale
+    );
     // cudaDeviceSynchronize();
+
+    ReorderVelocities<<<numBlock, blockSize>>>(m_numParticles, d_spatialIndices, d_sortedVelocities, d_velocities);
+    cudaDeviceSynchronize();
 
     // Update positions and handle collisions
     UpdatePositions<<<numBlock, blockSize>>>(d_positions, d_velocities, m_numParticles,
