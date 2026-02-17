@@ -90,6 +90,8 @@ file(GLOB_RECURSE sources
 
 add_executable(AnitoWave_SPH ${sources})
 
+target_compile_options(AnitoWave_SPH PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+
 target_include_directories(AnitoWave_SPH PRIVATE
         bgfx/include
         bx/include
