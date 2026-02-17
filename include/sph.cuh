@@ -76,6 +76,9 @@ private:
     uint32_t* d_spatialIndices;
     uint32_t* d_spatialKeys;
     uint32_t* d_startIndices;
+    // Sorted buffers
+    float* d_sortedPredictedPositions;
+    float* d_sortedVelocities;
 };
 
 #endif //ANITOWAVE_SPH_SPH_CUH
