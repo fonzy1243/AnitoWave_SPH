@@ -1,9 +1,37 @@
 #ifndef ANITOWAVE_SPH_SPH_CUH
 #define ANITOWAVE_SPH_SPH_CUH
 
+#include <tiny_obj_loader.h>
+#include <tiny_gltf.h>
+#include <tmd/TriangleMeshDistance.h>
+#include <iostream>
 #include <vector>
+#include <array>
+#include <string>
+#include <algorithm>
+#include <numbers>
+#include <bx/math.h>
+#include <thrust/sort.h>
+#include <thrust/device_ptr.h>
 
-enum ColliderType { TYPE_SPHERE = 0, TYPE_BOX = 1 };
+struct PosColorVertex {
+    float x, y, z;
+    float nx, ny, nz;
+    uint32_t abgr;
+};
+
+struct MeshSDFData {
+    std::vector<float> distanceData;
+    int resX, resY, resZ;
+    float3 minBounds;
+    float3 maxBounds;
+
+    // rendering data
+    std::vector<PosColorVertex> renderVertices;
+    std::vector<uint32_t> renderIndices;
+};
+
+enum ColliderType { TYPE_SPHERE = 0, TYPE_BOX = 1, TYPE_MESH = 2 };
 struct Collider {
     ColliderType type;
     float3 position;
@@ -13,6 +41,12 @@ struct Collider {
     float mass;
     float3 velocity;
     float3 forceAccumulator;
+
+    cudaTextureObject_t sdfTexture;
+    cudaArray_t sdfArray;
+    float3 gridMinBounds;
+    float3 gridMaxBounds;
+    float3 voxelSize;
 };
 
 struct SPHParams {
@@ -67,9 +101,9 @@ private:
     Collider* d_colliders = nullptr;
 
     // Physical values
-    float* d_positions;
-    float* d_predictedPositions;
-    float* d_velocities;
+    float *d_posX, *d_posY, *d_posZ;
+    float *d_predX, *d_predY, *d_predZ;
+    float *d_velX, *d_velY, *d_velZ;
     float* d_densities;
     float* d_nearDensities;
     // Spatial hashing
@@ -77,8 +111,10 @@ private:
     uint32_t* d_spatialKeys;
     uint32_t* d_startIndices;
     // Sorted buffers
-    float* d_sortedPredictedPositions;
-    float* d_sortedVelocities;
+    float *d_sortedPredX, *d_sortedPredY, *d_sortedPredZ;
+    float *d_sortedVelX, *d_sortedVelY, *d_sortedVelZ;
+    // AOS buffer for rendering
+    float* d_aos_temp;
 };
 
 #endif //ANITOWAVE_SPH_SPH_CUH

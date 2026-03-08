@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 4.1)
 project(AnitoWave_SPH CUDA CXX)
+include(FetchContent)
 
 set(CMAKE_CUDA_STANDARD 23)
 set(CMAKE_CXX_STANDARD 23)
@@ -19,6 +20,7 @@ set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_INSTALL OFF CACHE BOOL "GLFW lib only")
 
 add_subdirectory(.\\glfw)
+
 
 # -----------------
 # Shader compilation
@@ -96,6 +98,7 @@ target_include_directories(AnitoWave_SPH PRIVATE
         bgfx/include
         bx/include
         bimg/include
+        ${CMAKE_BINARY_DIR}/_deps/trianglemeshdistance-src/TriangleMeshDistance/include
 )
 
 target_include_directories(AnitoWave_SPH PRIVATE
@@ -167,6 +170,40 @@ endif()
 set_target_properties(AnitoWave_SPH PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON)
 
-target_link_libraries(AnitoWave_SPH glfw)
+FetchContent_Declare(
+        TriangleMeshDistance
+        GIT_REPOSITORY https://github.com/InteractiveComputerGraphics/TriangleMeshDistance.git
+        GIT_TAG        main
+)
+FetchContent_MakeAvailable(TriangleMeshDistance)
+
+FetchContent_Declare(
+        tinyobjloader
+        GIT_REPOSITORY https://github.com/tinyobjloader/tinyobjloader.git
+        GIT_TAG        release
+)
+FetchContent_MakeAvailable(tinyobjloader)
+
+FetchContent_Declare(
+        tinygltf
+        GIT_REPOSITORY https://github.com/syoyo/tinygltf.git
+        GIT_TAG        release
+)
+FetchContent_MakeAvailable(tinygltf)
+
+target_link_libraries(AnitoWave_SPH glfw tinyobjloader tinygltf)
 
 add_dependencies(AnitoWave_SPH compile_shaders)
+
+
+# -----------------
+# Mesh folder
+# -----------------
+file(MAKE_DIRECTORY ${CMAKE_SOURCE_DIR}/meshes)
+
+add_custom_command(TARGET AnitoWave_SPH POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/meshes"
+        "$<TARGET_FILE_DIR:AnitoWave_SPH>/meshes"
+        COMMENT "Copying meshes to output directory..."
+)

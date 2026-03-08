@@ -1,8 +1,4 @@
 #include <sph.cuh>
-#include <numbers>
-#include <bx/math.h>
-#include <thrust/sort.h>
-#include <thrust/device_ptr.h>
 
 __device__ const int3 CELL_OFFSETS[27] = {
     {-1,-1,-1}, { 0,-1,-1}, { 1,-1,-1},
@@ -15,6 +11,15 @@ __device__ const int3 CELL_OFFSETS[27] = {
     {-1, 0, 1}, { 0, 0, 1}, { 1, 0, 1},
     {-1, 1, 1}, { 0, 1, 1}, { 1, 1, 1}
 };
+
+__global__ void soa_to_aos(float* aos, const float* x, const float* y, const float* z, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    aos[i * 3] = x[i];
+    aos[i * 3 + 1] = y[i];
+    aos[i * 3 + 2] = z[i];
+}
 
 __device__ inline float3 loadFloat3(float* data, int idx, int limit) {
     if (idx < limit) {
@@ -157,9 +162,14 @@ __device__ float3 max(float3 a, float b) {
     return make_float3(max(a.x, b), max(a.y, b), max(a.z, b));
 }
 
+__device__ float3 max(float3 a, float3 b) {
+    return make_float3(fmaxf(a.x, b.x), fmaxf(a.y, b.y), fmaxf(a.z, b.z));
+}
+
 __device__ float3 abs(float3 a) {
     return make_float3(abs(a.x), abs(a.y), abs(a.z));
 }
+
 
 __device__ void atomicAddFloat3(float3* address, float3 val) {
     atomicAdd(&address->x, val.x);
@@ -176,6 +186,29 @@ __device__ float sdfBox(float3 p, float3 b) {
     return length(max(q, 0.0f)) + min(max(q.x, max(q.y, q.z)), 0.0f);
 }
 
+__device__ float sdfMesh(float3 localPos, Collider& col) {
+    float3 minB = col.gridMinBounds;
+    float3 maxB = col.gridMaxBounds;
+
+    // Check if the particle is outside the mesh's bounding box
+    if (localPos.x < minB.x || localPos.x > maxB.x ||
+        localPos.y < minB.y || localPos.y > maxB.y ||
+        localPos.z < minB.z || localPos.z > maxB.z) {
+
+        // Calculate the accurate positive distance to the outside of the box
+        float3 q = max(minB - localPos, max(localPos - maxB, make_float3(0.0f, 0.0f, 0.0f)));
+        return length(q) + 0.1f; // The +0.1f acts as a safety buffer
+        }
+
+    // Map local coordinate to 3D texture coordinate [0.0, 1.0]
+    float u = (localPos.x - minB.x) / (maxB.x - minB.x);
+    float v = (localPos.y - minB.y) / (maxB.y - minB.y);
+    float w = (localPos.z - minB.z) / (maxB.z - minB.z);
+
+    // Hardware-accelerated trilinear interpolation
+    return tex3D<float>(col.sdfTexture, u, v, w);
+}
+
 __device__ bool CheckSphereSphere(Collider& a, Collider& b, float3& normal, float& depth) {
     float3 delta = a.position - b.position;
     float dist = length(delta);
@@ -190,6 +223,76 @@ __device__ bool CheckSphereSphere(Collider& a, Collider& b, float3& normal, floa
     return false;
 }
 
+__device__ bool CheckSphereBox(Collider& sphere, Collider& box, float3& normal, float& depth) {
+    float3 localP = sphere.position - box.position;
+
+    float3 clamped = make_float3(
+        fmaxf(-box.dims.x, fminf(localP.x, box.dims.x)),
+        fmaxf(-box.dims.y, fminf(localP.y, box.dims.y)),
+        fmaxf(-box.dims.z, fminf(localP.z, box.dims.z))
+    );
+
+    float3 delta = localP - clamped;
+    float dist = length(delta);
+
+    if (dist > 1e-6f) {
+        if (dist >= sphere.dims.x) return false;
+
+        normal = delta / dist;
+        depth = sphere.dims.x - dist;
+        return true;
+    }
+
+    float3 overlap = make_float3(
+        box.dims.x - fabsf(localP.x),
+        box.dims.y - fabsf(localP.y),
+        box.dims.z - fabsf(localP.z)
+    );
+
+    float3 n;
+    float minOverlap;
+
+    if (overlap.x < overlap.y && overlap.y < overlap.z) {
+        minOverlap = overlap.x;
+        n = make_float3(localP.x < 0.f ? -1.f : 1.f, 0.f, 0.f);
+    } else if (overlap.y < overlap.z) {
+        minOverlap = overlap.y;
+        n = make_float3(0.f, localP.y < 0.f ? -1.f : 1.f, 0.f);
+    } else {
+        minOverlap = overlap.z;
+        n = make_float3(0.f, 0.f, localP.z < 0.f ? -1.f : 1.f);
+    }
+
+    normal = n;
+    depth = minOverlap + sphere.dims.x;
+    return true;
+}
+
+__device__ bool CheckBoxBox(Collider& a, Collider& b, float3& normal, float& depth) {
+    float3 delta = a.position - b.position;
+
+    float overlapX = (a.dims.x + b.dims.x) - fabsf(delta.x);
+    float overlapY = (a.dims.y + b.dims.y) - fabsf(delta.y);
+    float overlapZ = (a.dims.z + b.dims.z) - fabsf(delta.z);
+
+    if (overlapX <= 0.f || overlapY <= 0.f || overlapZ <= 0.f) {
+        return false;
+    }
+
+    if (overlapX < overlapY && overlapX < overlapZ) {
+        depth = overlapX;
+        normal = make_float3(delta.x < 0.f ? -1.f : 1.f, 0.f, 0.f);
+    } else if (overlapY < overlapZ) {
+        depth = overlapY;
+        normal = make_float3(0.f, delta.y < 0.f ? -1.f : 1.f, 0.f);
+    } else {
+        depth = overlapZ;
+        normal = make_float3(0.f, 0.f, delta.z < 0.f ? -1.f : 1.f);
+    }
+
+    return true;
+}
+
 __device__ float3 CalculateColliderNormal(float3 p, Collider c) {
     float e = 0.001f;
     float3 n = make_float3(0, 0, 0);
@@ -200,11 +303,19 @@ __device__ float3 CalculateColliderNormal(float3 p, Collider c) {
         float len = length(localP);
         if (len < 1e-6f) return make_float3(0, 1, 0);
         return localP / length(localP);
-    } else if (c.type == TYPE_BOX) {
+    }
+    if (c.type == TYPE_BOX) {
         float d = sdfBox(localP, c.dims);
         float x = sdfBox(make_float3(localP.x + e, localP.y, localP.z), c.dims) - d;
         float y = sdfBox(make_float3(localP.x, localP.y + e, localP.z), c.dims) - d;
         float z = sdfBox(make_float3(localP.x, localP.y, localP.z + e), c.dims) - d;
+        n = make_float3(x, y, z);
+    }
+    if (c.type == TYPE_MESH) {
+        float d = sdfMesh(localP, c);
+        float x = sdfMesh(make_float3(localP.x + e, localP.y, localP.z), c) - d;
+        float y = sdfMesh(make_float3(localP.x, localP.y + e, localP.z), c) - d;
+        float z = sdfMesh(make_float3(localP.x, localP.y, localP.z + e), c) - d;
         n = make_float3(x, y, z);
     }
 
@@ -235,15 +346,17 @@ __device__ uint32_t expandBits(uint32_t v) {
 }
 
 __device__ uint32_t HashCell(int cellX, int cellY, int cellZ) {
-    // uint32_t a = (uint32_t)cellX * 15823;
-    // uint32_t b = (uint32_t)cellY * 9737333;
-    // uint32_t c = (uint32_t)cellZ * 440817757;
-    // return a + b + c;
-    return expandBits(cellX) | (expandBits(cellY) << 1) | (expandBits(cellZ) << 2);
+    const int BIAS = 512;
+    uint32_t ux = (uint32_t)(cellX + BIAS);
+    uint32_t uy = (uint32_t)(cellY + BIAS);
+    uint32_t uz = (uint32_t)(cellZ + BIAS);
+    ux &= 0x3FFu; uy &= 0x3FFu; uz &= 0x3FFu;
+    return expandBits(ux) | (expandBits(uy) << 1) | (expandBits(uz) << 2);
 }
 
 __device__ uint32_t GetKeyFromHash(uint32_t hash, uint32_t hashTableSize) {
     return hash % hashTableSize;
+    // return hash & (hashTableSize - 1);
 }
 
 __device__ float2 ConvertDensityToPressure(float density, float nearDensity, float targetDensity, float pressureMultiplier, float nearPressureMultiplier) {
@@ -295,300 +408,13 @@ __device__ float NearDensityDerivativeKernel(float dst, float radius, float scal
     return -v * v * scale;
 }
 
-__device__ float2 CalculateDensity(const float* positions, const uint32_t* spatialIndices, const uint32_t* spatialKeys,
-    const uint32_t* startIndices, int numParticles, uint32_t hashTableSize, float3 samplePoint, float smoothingRadius,
-    float smoothingScale, float nearDensityScale
-    ) {
-    float density = 0.0f;
-    float nearDensity = 0.0f;
-    const float mass = 1.0f;
-
-    int3 center = PositionToCellCoord(samplePoint, smoothingRadius);
-    float sqrRadius = smoothingRadius * smoothingRadius;
-
-    for (int offsetX = -1; offsetX <= 1; offsetX++) {
-        for (int offsetY = -1; offsetY <= 1; offsetY++) {
-            for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
-                int3 cellCoord = make_int3(center.x + offsetX, center.y + offsetY, center.z + offsetZ);
-                uint32_t hash = HashCell(cellCoord.x, cellCoord.y, cellCoord.z);
-                uint32_t key = GetKeyFromHash(hash, hashTableSize);
-
-                uint32_t startIndex = startIndices[key];
-
-                for (uint32_t i = startIndex; i < numParticles; i++) {
-                    if (spatialKeys[i] != key) break;
-
-                    uint32_t particleIndex = spatialIndices[i];
-                    uint32_t idx = particleIndex * 3;
-                    float3 particlePos = make_float3(positions[idx], positions[idx + 1], positions[idx + 2]);
-
-                    int3 neighborCell = PositionToCellCoord(particlePos, smoothingRadius);
-                    uint32_t neighborHash = HashCell(neighborCell.x, neighborCell.y, neighborCell.z);
-                    if (neighborHash != hash) continue;
-
-                    float sqrDst = lengthSqr(particlePos - samplePoint);
-
-                    if (sqrDst <= sqrRadius) {
-                        float dst = sqrtf(sqrDst);
-                        float influence = SmoothingKernel(dst, smoothingRadius, smoothingScale);
-                        density += mass * influence;
-                        nearDensity += mass * NearDensityKernel(dst, smoothingRadius, nearDensityScale);
-                    }
-                }
-            }
-        }
-
-    }
-
-    return make_float2(density, nearDensity);
-}
-
-__device__ float3 CalculatePressureForce(int particleIndex, float* positions, float* densities, float* nearDensities,
-    uint32_t* spatialIndices, uint32_t* spatialKeys, uint32_t* startIndices, int numParticles, uint32_t hashTableSize,
-    float smoothingRadius, float targetDensity, float pressureMultiplier,
-    float nearPressureMultiplier, float smoothingDerivativeScale, float nearDerivativeScale) {
-    float3 pressureForce = make_float3(0, 0, 0);
-    const float mass = 1.0f;
-
-    int currentIdx = particleIndex * 3;
-    float3 samplePoint = make_float3(positions[currentIdx], positions[currentIdx + 1], positions[currentIdx + 2]);
-    float density = densities[particleIndex];
-    float nearDensity = nearDensities[particleIndex];
-
-    int3 center = PositionToCellCoord(samplePoint, smoothingRadius);
-    float sqrRadius = smoothingRadius * smoothingRadius;
-
-    for (int offsetX = -1; offsetX <= 1; offsetX++) {
-        for (int offsetY = -1; offsetY <= 1; offsetY++) {
-            for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
-                int3 cellCoord = make_int3(center.x + offsetX, center.y + offsetY, center.z + offsetZ);
-                uint32_t key = GetKeyFromHash(HashCell(cellCoord.x, cellCoord.y, cellCoord.z), hashTableSize);
-                uint32_t startIndex = startIndices[key];
-
-                for (uint32_t i = startIndex; i < numParticles; i++) {
-                    if (spatialKeys[i] != key) break;
-
-                    uint32_t otherParticleIndex = spatialIndices[i];
-                    if (particleIndex == otherParticleIndex) continue;
-
-                    uint32_t otherIdx = otherParticleIndex * 3;
-                    float px = __ldg(&positions[otherIdx]);
-                    float py = __ldg(&positions[otherIdx + 1]);
-                    float pz = __ldg(&positions[otherIdx + 2]);
-                    float3 otherPos = make_float3(px, py, pz);
-
-                    int3 neighborCell = PositionToCellCoord(otherPos, smoothingRadius);
-                    uint32_t neighborHash = HashCell(neighborCell.x, neighborCell.y, neighborCell.z);
-                    uint32_t currentHash = HashCell(cellCoord.x, cellCoord.y, cellCoord.z);
-
-                    if (neighborHash != currentHash) continue;
-
-                    float3 offset = otherPos - samplePoint;
-                    float sqrDst = lengthSqr(offset);
-
-                    if (sqrDst <= sqrRadius) {
-                        // float dst = sqrtf(sqrDst);
-                        // float3 dir = dst == 0.0f ? make_float3(0, 0, 0) : offset / dst;
-                        float invDst = rsqrt(sqrDst);
-                        float dst = sqrDst * invDst;
-                        float3 dir = (sqrDst > 1e-10f) ? (offset * invDst) : make_float3(0, 0, 0);
-                        float slope = SmoothingKernelDerivative(dst, smoothingRadius, smoothingDerivativeScale);
-                        float nearSlope = NearDensityDerivativeKernel(dst, smoothingRadius, nearDerivativeScale);
-                        float otherDensity = __ldg(&densities[otherParticleIndex]);
-                        float otherNearDensity = __ldg(&nearDensities[otherParticleIndex]);
-                        float2 sharedPressure = CalculateSharedPressure(density, nearDensity, otherDensity, otherNearDensity, targetDensity, pressureMultiplier, nearPressureMultiplier);
-
-                        // float combinedForce = (sharedPressure.x * slope) + (sharedPressure.y * nearSlope);
-                        // pressureForce += combinedForce * dir * mass / otherDensity;
-                        pressureForce += dir * sharedPressure.x * slope * mass / otherDensity;
-                        pressureForce += dir * sharedPressure.y * nearSlope * mass / otherDensity;
-                    }
-                }
-            }
-        }
-    }
-
-    return pressureForce;
-}
-
-__device__ float3 CalculateViscosityForce(int particleIndex, float* positions, float* velocities,
-    uint32_t* spatialIndices, uint32_t* spatialKeys, uint32_t* startIndices,
-    int numParticles, uint32_t hashTableSize, float smoothingRadius, float viscosityStrength, float viscosityScale) {
-    float3 viscosityForce = make_float3(0, 0, 0);
-    int currentIdx = particleIndex * 3;
-
-    float3 position = make_float3(positions[currentIdx], positions[currentIdx + 1], positions[currentIdx + 2]);
-    float3 velocity = make_float3(velocities[currentIdx], velocities[currentIdx + 1], velocities[currentIdx + 2]);
-
-    int3 center = PositionToCellCoord(position, smoothingRadius);
-    float sqrRadius = smoothingRadius * smoothingRadius;
-
-    for (int offsetX = -1; offsetX <= 1; offsetX++) {
-        for (int offsetY = -1; offsetY <= 1; offsetY++) {
-            for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
-                int3 cellCoord = make_int3(center.x + offsetX, center.y + offsetY, center.z + offsetZ);
-                uint32_t key = GetKeyFromHash(HashCell(cellCoord.x, cellCoord.y, cellCoord.z), hashTableSize);
-                uint32_t startIndex = startIndices[key];
-
-                for (uint32_t i = startIndex; i < numParticles; i++) {
-                    if (spatialKeys[i] != key) break;
-
-                    uint32_t otherParticleIndex = spatialIndices[i];
-                    if (particleIndex == otherParticleIndex) continue;
-
-                    int otherIdx = otherParticleIndex * 3;
-                    float3 otherPos = make_float3(positions[otherIdx], positions[otherIdx + 1], positions[otherIdx + 2]);
-
-                    int3 neighborCell = PositionToCellCoord(otherPos, smoothingRadius);
-                    uint32_t neighborHash = HashCell(neighborCell.x, neighborCell.y, neighborCell.z);
-                    uint32_t currentHash = HashCell(cellCoord.x, cellCoord.y, cellCoord.z);
-                    if (neighborHash != currentHash) continue;
-
-                    float3 otherVel = make_float3(velocities[otherIdx], velocities[otherIdx + 1], velocities[otherIdx + 2]);
-
-                    float sqrDst = lengthSqr(otherPos - position);
-
-                    if (sqrDst <= sqrRadius) {
-                        float dst = sqrtf(sqrDst);
-                        float influence = ViscositySmoothingKernel(dst, smoothingRadius, viscosityScale);
-
-                        viscosityForce += (otherVel - velocity) * influence;
-                    }
-                }
-            }
-        }
-    }
-
-    return viscosityForce * viscosityStrength;
-}
-
-__device__ void ResolveCollisions(float* positions, float* velocities, int numParticles, float particleSize, float boundsX, float boundsY, float boundsZ, float collisionDamping) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= numParticles) return;
-
-    int idx = i * 3;
-
-    float3 posLocal = make_float3(positions[idx], positions[idx + 1], positions[idx + 2]);
-    float3 velocityLocal = make_float3(velocities[idx], velocities[idx + 1], velocities[idx + 2]);
-
-    const float3 halfSize = make_float3(boundsX / 2, boundsY / 2, boundsZ / 2);
-    const float3 edgeDst = make_float3(halfSize.x - abs(posLocal.x), halfSize.y - abs(posLocal.y), halfSize.z - abs(posLocal.z));
-
-    if (edgeDst.x <= 0) {
-        posLocal.x = halfSize.x * sign(posLocal.x);
-        velocityLocal.x *= -1 * collisionDamping;
-    }
-    if (edgeDst.y <= 0) {
-        posLocal.y = halfSize.y * sign(posLocal.y);
-        velocityLocal.y *= -1 * collisionDamping;
-    }
-    if (edgeDst.z <= 0) {
-        posLocal.z = halfSize.z * sign(posLocal.z);
-        velocityLocal.z *= -1 * collisionDamping;
-    }
-
-    positions[idx] = posLocal.x;
-    positions[idx + 1] = posLocal.y;
-    positions[idx + 2] = posLocal.z;
-
-    velocities[idx] = velocityLocal.x;
-    velocities[idx + 1] = velocityLocal.y;
-    velocities[idx + 2] = velocityLocal.z;
-}
-
-__device__ float3 CalculateCombinedForces(
-    int particleIndex,
-    float* positions,
-    float* velocities,
-    float* densities,
-    float* nearDensities,
-    uint32_t* spatialIndices,
-    uint32_t* spatialKeys,
-    uint32_t* startIndices,
-    int numParticles,
-    uint32_t hashTableSize,
-    float smoothingRadius,
-    float targetDensity,
-    float pressureMultiplier,
-    float nearPressureMultiplier,
-    float viscosityStrength,
-    float smoothingDerivativeScale,
-    float nearDerivativeScale,
-    float viscosityScale
-) {
-    float3 totalForce = make_float3(0, 0, 0);
-    const float mass = 1.0f;
-
-    int currentIdx = particleIndex * 3;
-    float3 samplePoint = make_float3(positions[currentIdx], positions[currentIdx + 1], positions[currentIdx + 2]);
-    float3 velocity = make_float3(velocities[currentIdx], velocities[currentIdx + 1], velocities[currentIdx + 2]);
-
-    float density = densities[particleIndex];
-    float nearDensity = nearDensities[particleIndex];
-
-    int3 center = PositionToCellCoord(samplePoint, smoothingRadius);
-    float sqrRadius = smoothingRadius * smoothingRadius;
-
-    for (int offsetX = -1; offsetX <= 1; offsetX++) {
-        for (int offsetY = -1; offsetY <= 1; offsetY++) {
-            for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
-                int3 cellCoord = make_int3(center.x + offsetX, center.y + offsetY, center.z + offsetZ);
-                uint32_t key = GetKeyFromHash(HashCell(cellCoord.x, cellCoord.y, cellCoord.z), hashTableSize);
-                uint32_t startIndex = startIndices[key];
-
-                for (uint32_t i = startIndex; i < numParticles; i++) {
-                    if (spatialKeys[i] != key) break;
-
-                    uint32_t otherParticleIndex = spatialIndices[i];
-                    if (particleIndex == otherParticleIndex) continue;
-
-                    uint32_t otherIdx = otherParticleIndex * 3;
-
-                    // Load position once for both calculations
-                    float px = __ldg(&positions[otherIdx]);
-                    float py = __ldg(&positions[otherIdx + 1]);
-                    float pz = __ldg(&positions[otherIdx + 2]);
-                    float3 otherPos = make_float3(px, py, pz);
-
-                    float3 offset = otherPos - samplePoint;
-                    float sqrDst = lengthSqr(offset);
-
-                    if (sqrDst <= sqrRadius) {
-                        float invDst = rsqrt(sqrDst);
-                        float dst = sqrDst * invDst;
-
-                        float3 dir = (sqrDst > 1e-10f) ? (offset * invDst) : make_float3(0, 0, 0);
-                        float slope = SmoothingKernelDerivative(dst, smoothingRadius, smoothingDerivativeScale);
-                        float nearSlope = NearDensityDerivativeKernel(dst, smoothingRadius, nearDerivativeScale);
-
-                        float otherDensity = __ldg(&densities[otherParticleIndex]);
-                        float otherNearDensity = __ldg(&nearDensities[otherParticleIndex]);
-
-                        float2 sharedPressure = CalculateSharedPressure(density, nearDensity, otherDensity, otherNearDensity, targetDensity, pressureMultiplier, nearPressureMultiplier);
-
-                        totalForce += dir * sharedPressure.x * slope * mass / otherDensity;
-                        totalForce += dir * sharedPressure.y * nearSlope * mass / otherDensity;
-
-                        // Only load velocity if we are actually inside the radius
-                        float vx = __ldg(&velocities[otherIdx]);
-                        float vy = __ldg(&velocities[otherIdx + 1]);
-                        float vz = __ldg(&velocities[otherIdx + 2]);
-                        float3 otherVel = make_float3(vx, vy, vz);
-
-                        float influence = ViscositySmoothingKernel(dst, smoothingRadius, viscosityScale);
-                        totalForce += (otherVel - velocity) * influence * viscosityStrength;
-                    }
-                }
-            }
-        }
-    }
-
-    return totalForce;
-}
-
-__global__ void ApplyPressureForces_Optimized(
-    const float* __restrict__ predictedPositions,
-    float*                    velocities,
+__global__
+__launch_bounds__(256, 2)
+void ApplyPressureForces_Optimized(
+    const float* __restrict__ predX,
+    const float* __restrict__ predY,
+    const float* __restrict__ predZ,
+    float* velX, float* velY, float* velZ,
     const float* __restrict__ densities,
     const float* __restrict__ nearDensities,
     const uint32_t* __restrict__ spatialIndices,
@@ -618,13 +444,12 @@ __global__ void ApplyPressureForces_Optimized(
     float  myDensity, myNearDensity;
 
     if (i < numParticles) {
-        int idx   = i * 3;
-        samplePos     = make_float3(__ldg(&predictedPositions[idx]),
-                                    __ldg(&predictedPositions[idx+1]),
-                                    __ldg(&predictedPositions[idx+2]));
-        myVel         = make_float3(__ldg(&velocities[idx]),
-                                    __ldg(&velocities[idx+1]),
-                                    __ldg(&velocities[idx+2]));
+        samplePos     = make_float3(__ldg(&predX[i]),
+                                    __ldg(&predY[i]),
+                                    __ldg(&predZ[i]));
+        myVel         = make_float3(__ldg(&velX[i]),
+                                    __ldg(&velY[i]),
+                                    __ldg(&velZ[i]));
         myDensity     = __ldg(&densities[i]);
         myNearDensity = __ldg(&nearDensities[i]);
     } else {
@@ -706,10 +531,9 @@ __global__ void ApplyPressureForces_Optimized(
                 if (j >= blockStart && j < blockEnd) continue; // handled in Phase 1
                 if (j == (uint32_t)i) continue;
 
-                int    oidx     = j * 3;
-                float3 otherPos = make_float3(__ldg(&predictedPositions[oidx]),
-                                              __ldg(&predictedPositions[oidx+1]),
-                                              __ldg(&predictedPositions[oidx+2]));
+                float3 otherPos = make_float3(__ldg(&predX[j]),
+                                              __ldg(&predY[j]),
+                                              __ldg(&predZ[j]));
                 float3 offset   = otherPos - samplePos;
                 float  sqrDst   = lengthSqr(offset);
 
@@ -720,9 +544,9 @@ __global__ void ApplyPressureForces_Optimized(
 
                     float otherDensity     = __ldg(&densities[j]);
                     float otherNearDensity = __ldg(&nearDensities[j]);
-                    float3 otherVel        = make_float3(__ldg(&velocities[oidx]),
-                                                         __ldg(&velocities[oidx+1]),
-                                                         __ldg(&velocities[oidx+2]));
+                    float3 otherVel        = make_float3(__ldg(&velX[j]),
+                                                         __ldg(&velY[j]),
+                                                         __ldg(&velZ[j]));
 
                     float slope     = SmoothingKernelDerivative(dst, smoothingRadius, smoothingDerivativeScale);
                     float nearSlope = NearDensityDerivativeKernel(dst, smoothingRadius, nearDerivativeScale);
@@ -743,28 +567,25 @@ __global__ void ApplyPressureForces_Optimized(
     float3 totalForce   = pressureForce + (viscosityForce * viscosityStrength);
     float3 acceleration = totalForce / max(myDensity, 0.0001f);
 
-    int idx = i * 3;
-    velocities[idx]   += acceleration.x * dt;
-    velocities[idx+1] += acceleration.y * dt;
-    velocities[idx+2] += acceleration.z * dt;
+    velX[i]   += acceleration.x * dt;
+    velY[i] += acceleration.y * dt;
+    velZ[i] += acceleration.z * dt;
 }
 
-
-__global__ void UpdatePositions(float* positions, float* velocities, int numParticles, float particleSize, float boundsX, float boundsY, float boundsZ,
-    float collisionDamping, float gravity, float dt, Collider* colliders, int numColliders, float smoothingRadius, float colliderDragModifier) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void UpdatePositions(
+    float* posX, float* posY, float* posZ,
+    float* velX, float* velY, float* velZ,
+    int numParticles, float particleSize, float boundsX, float boundsY, float boundsZ,
+    float collisionDamping, float gravity, float dt,
+    Collider* colliders, int numColliders, float smoothingRadius, float colliderDragModifier) {
+int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numParticles) return;
 
-    int idx = i * 3;
+    float3 posLocal = make_float3(posX[i], posY[i], posZ[i]);
+    float3 velLocal = make_float3(velX[i], velY[i], velZ[i]);
 
-    positions[idx] += velocities[idx] * dt;
-    positions[idx + 1] += velocities[idx + 1] * dt;
-    positions[idx + 2] += velocities[idx + 2] * dt;
+    posLocal += velLocal * dt;
 
-    float3 posLocal = make_float3(positions[idx], positions[idx + 1], positions[idx + 2]);
-    float3 velocityLocal = make_float3(velocities[idx], velocities[idx + 1], velocities[idx + 2]);
-
-    // Primitive collision
     for (int k = 0; k < numColliders; k++) {
         Collider col = colliders[k];
         float3 relPos = posLocal - col.position;
@@ -774,35 +595,41 @@ __global__ void UpdatePositions(float* positions, float* velocities, int numPart
             dist = sdfSphere(relPos, col.dims.x);
         } else if (col.type == TYPE_BOX) {
             dist = sdfBox(relPos, col.dims);
+        } else if (col.type == TYPE_MESH) {
+            dist = sdfMesh(relPos, col);
         }
 
+        // Fluid-Structure Coupling (Drag + Buoyancy)
         if (col.isDynamic && dist < smoothingRadius) {
-            float3 relativeVel = velocityLocal - col.velocity;
+            float3 relativeVel = velLocal - col.velocity;
             float weight = 1.0f - (max(0.0f, dist) / smoothingRadius);
 
             float3 dragForce = relativeVel * weight * colliderDragModifier;
+
             atomicAddFloat3(&colliders[k].forceAccumulator, dragForce);
-            velocityLocal -= dragForce * dt;
+
+            velLocal -= dragForce * dt;
 
             float particleMass = 1.0f;
             float3 buoyancyDirection = make_float3(0, 1, 0);
-
             float buoyancyStrength = weight * particleMass * gravity;
-            float3 buoyancyForce = buoyancyDirection * buoyancyStrength;
-            atomicAddFloat3(&colliders[k].forceAccumulator, buoyancyForce);
+
+            atomicAddFloat3(&colliders[k].forceAccumulator, buoyancyDirection * buoyancyStrength);
         }
 
+        // Hard Collision Resolution
         if (dist < particleSize) {
             float3 normal = CalculateColliderNormal(posLocal, col);
             float penetration = particleSize - dist;
 
             posLocal += normal * penetration;
 
-            float3 relativeVelocity = velocityLocal - col.velocity;
+            float3 relativeVelocity = velLocal - col.velocity;
             float normalVel = dot(relativeVelocity, normal);
+
             if (normalVel < 0) {
                 float3 velocityChange = normal * normalVel * (1.0f + collisionDamping);
-                velocityLocal -= velocityChange;
+                velLocal -= velocityChange;
 
                 if (col.isDynamic) {
                     float particleMass = 3.0f;
@@ -819,31 +646,31 @@ __global__ void UpdatePositions(float* positions, float* velocities, int numPart
 
     const float3 halfSize = make_float3(boundsX / 2, boundsY / 2, boundsZ / 2);
     const float3 edgeDst = make_float3(
-        halfSize.x - std::abs(posLocal.x),
-        halfSize.y - std::abs(posLocal.y),
-        halfSize.z - std::abs(posLocal.z)
-        );
+        halfSize.x - abs(posLocal.x),
+        halfSize.y - abs(posLocal.y),
+        halfSize.z - abs(posLocal.z)
+    );
 
     if (edgeDst.x <= 0) {
-        posLocal.x = posLocal.x > 0 ? halfSize.x : -halfSize.x;
-        velocityLocal.x *= -1 * collisionDamping;
+        posLocal.x = halfSize.x * sign(posLocal.x);
+        velLocal.x *= -1 * collisionDamping;
     }
     if (edgeDst.y <= 0) {
-        posLocal.y = posLocal.y > 0 ? halfSize.y : -halfSize.y;
-        velocityLocal.y *= -1 * collisionDamping;
+        posLocal.y = halfSize.y * sign(posLocal.y);
+        velLocal.y *= -1 * collisionDamping;
     }
     if (edgeDst.z <= 0) {
-        posLocal.z = posLocal.z > 0 ? halfSize.z : -halfSize.z;
-        velocityLocal.z *= -1 * collisionDamping;
+        posLocal.z = halfSize.z * sign(posLocal.z);
+        velLocal.z *= -1 * collisionDamping;
     }
 
-    positions[idx] = posLocal.x;
-    positions[idx + 1] = posLocal.y;
-    positions[idx + 2] = posLocal.z;
+    posX[i] = posLocal.x;
+    posY[i] = posLocal.y;
+    posZ[i] = posLocal.z;
 
-    velocities[idx] = velocityLocal.x;
-    velocities[idx + 1] = velocityLocal.y;
-    velocities[idx + 2] = velocityLocal.z;
+    velX[i] = velLocal.x;
+    velY[i] = velLocal.y;
+    velZ[i] = velLocal.z;
 }
 
 __global__ void IntegrateColliders(Collider* colliders, int numColliders, float boundsX, float boundsY, float boundsZ,
@@ -858,6 +685,7 @@ __global__ void IntegrateColliders(Collider* colliders, int numColliders, float 
         return;
     }
 
+
     float3 totalForce = col.forceAccumulator;
     totalForce.y += -1.0f * gravity * col.mass;
 
@@ -871,6 +699,8 @@ __global__ void IntegrateColliders(Collider* colliders, int numColliders, float 
     float3 extents;
     if (col.type == TYPE_SPHERE) {
         extents = make_float3(col.dims.x, col.dims.x, col.dims.x);
+    } else if (col.type == TYPE_MESH) {
+        extents = ((col.gridMaxBounds - col.gridMinBounds) / 2.0f) - make_float3(1.0, 1.0, 1.0);
     } else {
         extents = col.dims;
     }
@@ -927,17 +757,17 @@ __global__ void ResolveColliderCollisions(Collider* colliders, int numColliders)
         if (colA.type == TYPE_SPHERE && colB.type == TYPE_SPHERE) {
             collision = CheckSphereSphere(colA, colB, normal, depth);
         }
-        // else if (colA.type == TYPE_SPHERE && colB.type == TYPE_BOX) {
-        //     collision = CheckSphereBox(colA, colB, normal, depth);
-        // }
-        // else if (colA.type == TYPE_BOX && colB.type == TYPE_SPHERE) {
-        //     // Flip normal because we pass (Sphere, Box)
-        //     collision = CheckSphereBox(colB, colA, normal, depth);
-        //     normal = normal * -1.0f;
-        // }
-        // else if (colA.type == TYPE_BOX && colB.type == TYPE_BOX) {
-        //     collision = CheckBoxBox(colA, colB, normal, depth);
-        // }
+        else if (colA.type == TYPE_SPHERE && colB.type == TYPE_BOX) {
+            collision = CheckSphereBox(colA, colB, normal, depth);
+        }
+        else if (colA.type == TYPE_BOX && colB.type == TYPE_SPHERE) {
+            // Flip normal because we pass (Sphere, Box)
+            collision = CheckSphereBox(colB, colA, normal, depth);
+            normal = normal * -1.0f;
+        }
+        else if (colA.type == TYPE_BOX && colB.type == TYPE_BOX) {
+            collision = CheckBoxBox(colA, colB, normal, depth);
+        }
 
         if (collision) {
             const float percent = 0.2f; // Penetration percentage to correct
@@ -973,40 +803,28 @@ __global__ void ResolveColliderCollisions(Collider* colliders, int numColliders)
     }
 }
 
-__global__ void PredictPositions(float* positions, float* predictedPositions, float* velocities, int numParticles, float gravity, float dt) {
+__global__ void PredictPositions(
+    float* posX, float* posY, float* posZ,
+    float* predPosX, float* predPosY, float* predPosZ,
+    float* velX, float* velY, float* velZ,
+    int numParticles, float gravity, float dt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numParticles) return;
 
-    int idx = i * 3;
-
-    velocities[idx + 1] += -1 * gravity * dt;
-    predictedPositions[idx] = positions[idx] + velocities[idx] * dt;
-    predictedPositions[idx + 1] = positions[idx + 1] + velocities[idx + 1] * dt;
-    predictedPositions[idx + 2] = positions[idx + 2] + velocities[idx + 2] * dt;
-    // predictedPositions[idx] = positions[idx] + velocities[idx] * 1 / 120.0f;
-    // predictedPositions[idx + 1] = positions[idx + 1] + velocities[idx + 1] * 1 / 120.0f;
-    // predictedPositions[idx + 2] = positions[idx + 2] + velocities[idx + 2] * 1 / 120.0f;
+    velY[i] += -1 * gravity * dt;
+    predPosX[i] = posX[i] + velX[i] * dt;
+    predPosY[i] = posY[i] + velY[i] * dt;
+    predPosZ[i] = posZ[i] + velZ[i] * dt;
 }
 
-__global__ void UpdateDensities(float* positions, float* velocities, float* densities, float* nearDensities,
-    uint32_t* spatialIndices, uint32_t* spatialKeys, uint32_t* startIndices, int numParticles, uint32_t hashTableSize,
-    float smoothingRadius, float gravity, float dt, float smoothingScale, float nearDensityScale) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= numParticles) return;
-
-    int idx = i * 3;
-
-    float3 samplePoint  = make_float3(positions[idx], positions[idx + 1], positions[idx + 2]);
-    float2 result = CalculateDensity(positions, spatialIndices, spatialKeys, startIndices, numParticles, hashTableSize, samplePoint, smoothingRadius, smoothingScale, nearDensityScale);
-    densities[i] = result.x;
-    nearDensities[i] = result.y;
-}
-
-__global__ void UpdateDensities_Shared(
-    float* positions, // SORTED
-    uint32_t* spatialIndices,
-    uint32_t* spatialKeys,
-    uint32_t* startIndices,
+__global__
+__launch_bounds__(256, 4)
+void UpdateDensities_Optimized(
+    const float* __restrict__ posX,
+    const float* __restrict__ posY,
+    const float* __restrict__ posZ,
+    const uint32_t* __restrict__ spatialKeys,
+    const uint32_t* __restrict__ startIndices,
     int numParticles,
     uint32_t hashTableSize,
     float smoothingRadius,
@@ -1015,26 +833,49 @@ __global__ void UpdateDensities_Shared(
     float* densities,
     float* nearDensities
 ) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= numParticles) return;
+    const int tid = threadIdx.x;
+    const int i = blockIdx.x * blockDim.x + tid;
+    const int BS = blockDim.x;
 
-    int idx = i * 3;
-    float3 myPos = make_float3(positions[idx], positions[idx+1], positions[idx+2]);
+    // 1. Setup Shared Memory (SoA layout)
+    extern __shared__ float s_data[];
+    float* s_posX = s_data;
+    float* s_posY = s_posX + BS;
+    float* s_posZ = s_posY + BS;
 
-    extern __shared__ float3 s_pos[];
-    s_pos[threadIdx.x] = myPos;
+    float3 myPos;
+
+    // 2. Load Data into Registers and Shared Memory
+    if (i < numParticles) {
+        myPos = make_float3(__ldg(&posX[i]), __ldg(&posY[i]), __ldg(&posZ[i]));
+    } else {
+        myPos = make_float3(0.0f, 0.0f, 0.0f);
+    }
+
+    s_posX[tid] = myPos.x;
+    s_posY[tid] = myPos.y;
+    s_posZ[tid] = myPos.z;
     __syncthreads();
+
+    if (i >= numParticles) return;
 
     float density = 0.0f;
     float nearDensity = 0.0f;
     float sqrRadius = smoothingRadius * smoothingRadius;
     const float mass = 1.0f;
 
-    #pragma unroll
-    for (int j = 0; j < blockDim.x; j++) {
-        if ((blockIdx.x * blockDim.x + j) >= numParticles) break;
-        float3 sPos = s_pos[j];
+    // 3. Phase 1: Shared Memory Interaction (Same Block)
+    // Iterate over all particles in the current shared memory block
+    // Since data is sorted, these are highly likely to be neighbors
+    #pragma unroll 4
+    for (int j = 0; j < BS; j++) {
+        // Note: We include self-interaction here (when j == tid), which ensures
+        // the particle contributes its own mass to its density.
+        if ((blockIdx.x * BS + j) >= numParticles) break;
+
+        float3 sPos = make_float3(s_posX[j], s_posY[j], s_posZ[j]);
         float sqrDst = lengthSqr(sPos - myPos);
+
         if (sqrDst <= sqrRadius) {
             float dst = sqrtf(sqrDst);
             density += mass * SmoothingKernel(dst, smoothingRadius, smoothingScale);
@@ -1042,37 +883,35 @@ __global__ void UpdateDensities_Shared(
         }
     }
 
+    // 4. Phase 2: Grid Interaction (Neighboring Cells)
     int3 center = PositionToCellCoord(myPos, smoothingRadius);
-    uint32_t blockStart = blockIdx.x * blockDim.x;
-    uint32_t blockEnd   = blockStart + blockDim.x;
+    uint32_t blockStart = blockIdx.x * BS;
+    uint32_t blockEnd   = blockStart + BS;
 
-    for (int offsetX = -1; offsetX <= 1; offsetX++) {
-        for (int offsetY = -1; offsetY <= 1; offsetY++) {
-            for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
-                int3 cellCoord = make_int3(center.x + offsetX, center.y + offsetY, center.z + offsetZ);
-                uint32_t hash = HashCell(cellCoord.x, cellCoord.y, cellCoord.z);
-                uint32_t key = GetKeyFromHash(hash, hashTableSize);
-                uint32_t startIndex = startIndices[key];
+    for (int c = 0; c < 27; c++) {
+        int3 cellCoord = center + CELL_OFFSETS[c];
+        uint32_t key = GetKeyFromHash(HashCell(cellCoord.x, cellCoord.y, cellCoord.z), hashTableSize);
+        uint32_t startIndex = __ldg(&startIndices[key]);
 
-                if (startIndex == 0xffffffff) continue;
+        if (startIndex == 0xffffffff) continue;
 
-                for (uint32_t j = startIndex; j < numParticles; j++) {
-                    if (spatialKeys[j] != key) break;
-                    if (j >= blockStart && j < blockEnd) continue; // Skip shared mem
+        for (uint32_t j = startIndex; j < numParticles; j++) {
+            if (__ldg(&spatialKeys[j]) != key) break;
 
-                    int oIdx = j * 3;
-                    float px = __ldg(&positions[oIdx]);
-                    float py = __ldg(&positions[oIdx + 1]);
-                    float pz = __ldg(&positions[oIdx + 2]);
-                    float3 otherPos = make_float3(px, py, pz);
+            // Critical optimization: Skip particles already processed in Shared Memory loop
+            if (j >= blockStart && j < blockEnd) continue;
 
-                    float sqrDst = lengthSqr(otherPos - myPos);
-                    if (sqrDst <= sqrRadius) {
-                        float dst = sqrtf(sqrDst);
-                        density += mass * SmoothingKernel(dst, smoothingRadius, smoothingScale);
-                        nearDensity += mass * NearDensityKernel(dst, smoothingRadius, nearDensityScale);
-                    }
-                }
+            float3 otherPos = make_float3(
+                __ldg(&posX[j]),
+                __ldg(&posY[j]),
+                __ldg(&posZ[j])
+            );
+
+            float sqrDst = lengthSqr(otherPos - myPos);
+            if (sqrDst <= sqrRadius) {
+                float dst = sqrtf(sqrDst);
+                density += mass * SmoothingKernel(dst, smoothingRadius, smoothingScale);
+                nearDensity += mass * NearDensityKernel(dst, smoothingRadius, nearDensityScale);
             }
         }
     }
@@ -1081,14 +920,18 @@ __global__ void UpdateDensities_Shared(
     nearDensities[i] = nearDensity;
 }
 
-__global__ void UpdateSpatialHash(float* positions, int numParticles, uint32_t hashTableSize, float radius, uint32_t* spatialIndices, uint32_t* spatialKeys, uint32_t* startIndices) {
+__global__ void UpdateSpatialHash(
+    float* posX, float* posY, float* posZ,
+    int numParticles,
+    uint32_t hashTableSize,
+    float radius,
+    uint32_t* spatialIndices,
+    uint32_t* spatialKeys,
+    uint32_t* startIndices) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numParticles) return;
 
-    int idx = i * 3;
-    float3 pos = make_float3(positions[idx], positions[idx + 1], positions[idx + 2]);
-
-    // startIndices[i] = 0xffffffff;
+    float3 pos = make_float3(posX[i], posY[i], posZ[i]);
 
     int3 cell = PositionToCellCoord(pos, radius);
     uint32_t cellKey = GetKeyFromHash(HashCell(cell.x, cell.y, cell.z), hashTableSize);
@@ -1111,41 +954,39 @@ __global__ void UpdateStartIndices(uint32_t* spatialKeys, uint32_t* startIndices
 __global__ void SortData(
     int numParticles,
     uint32_t* spatialIndices,
-    float* positions, float* sortedPositions,
-    float* velocities, float* sortedVelocities
+    float* posX, float* posY, float* posZ,
+    float* sortedPosX, float* sortedPosY, float* sortedPosZ,
+    float* velX, float* velY, float* velZ,
+    float* sortedVelX, float* sortedVelY, float* sortedVelZ
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numParticles) return;
 
     int originalIndex = spatialIndices[i];
-    int idx = i * 3;
-    int originalIdx = originalIndex * 3;
 
-    sortedPositions[idx] = positions[originalIdx];
-    sortedPositions[idx + 1] = positions[originalIdx + 1];
-    sortedPositions[idx + 2] = positions[originalIdx + 2];
+    sortedPosX[i] = posX[originalIndex];
+    sortedPosY[i] = posY[originalIndex];
+    sortedPosZ[i] = posZ[originalIndex];
 
-    sortedVelocities[idx] = velocities[originalIdx];
-    sortedVelocities[idx + 1] = velocities[originalIdx + 1];
-    sortedVelocities[idx + 2] = velocities[originalIdx + 2];
+    sortedVelX[i] = velX[originalIndex];
+    sortedVelY[i] = velY[originalIndex];
+    sortedVelZ[i] = velZ[originalIndex];
 }
 
 __global__ void ReorderVelocities(
     int numParticles,
     uint32_t* spatialIndices,
-    float* sortedVelocities,
-    float* originalVelocities
+    float* sortedVelX, float* sortedVelY, float* sortedVelZ,
+    float* origVelX, float* origVelY, float* origVelZ
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numParticles) return;
 
     int originalIndex = spatialIndices[i];
-    int idx = i * 3;
-    int originalIdx = originalIndex * 3;
 
-    originalVelocities[originalIdx] = sortedVelocities[idx];
-    originalVelocities[originalIdx + 1] = sortedVelocities[idx + 1];
-    originalVelocities[originalIdx + 2] = sortedVelocities[idx + 2];
+    origVelX[originalIndex] = sortedVelX[i];
+    origVelY[originalIndex] = sortedVelY[i];
+    origVelZ[originalIndex] = sortedVelZ[i];
 }
 
 // Pseudocode for using the spatial hashing
@@ -1175,11 +1016,10 @@ void SPHSolver::UpdateSpatialLookup() {
     int blockSize = 256;
     int numBlock = (m_numParticles + blockSize - 1) / blockSize;
 
-    cudaMemset(d_spatialIndices, 0xffffffff, m_maxParticles * sizeof(uint32_t));
-    cudaMemset(d_startIndices, 0xffffffff, m_hashTableSize * sizeof(uint32_t));
+    cudaMemsetAsync(d_spatialIndices, 0xffffffff, m_maxParticles * sizeof(uint32_t));
+    cudaMemsetAsync(d_startIndices, 0xffffffff, m_hashTableSize * sizeof(uint32_t));
 
-    UpdateSpatialHash<<<numBlock, blockSize>>>(d_predictedPositions, m_numParticles, m_hashTableSize, m_params.smoothingRadius, d_spatialIndices, d_spatialKeys, d_startIndices);
-    cudaDeviceSynchronize();
+    UpdateSpatialHash<<<numBlock, blockSize>>>(d_predX, d_predY, d_predZ, m_numParticles, m_hashTableSize, m_params.smoothingRadius, d_spatialIndices, d_spatialKeys, d_startIndices);
 
     // Sort by cell key
     thrust::device_ptr<uint32_t> t_keys(d_spatialKeys);
@@ -1193,32 +1033,81 @@ void SPHSolver::UpdateSpatialLookup() {
 
 SPHSolver::SPHSolver(int maxParticles) : m_maxParticles(maxParticles), m_numParticles(0) {
     m_hashTableSize = m_maxParticles * 2;
-    size_t size = m_maxParticles * 3 * sizeof(float);
-    cudaMalloc(&d_positions, size);
-    cudaMalloc(&d_predictedPositions, size);
-    cudaMalloc(&d_sortedPredictedPositions, size);
-    cudaMalloc(&d_velocities, size);
-    cudaMalloc(&d_sortedVelocities, size);
+    cudaMalloc(&d_posX, m_maxParticles * sizeof(float));
+    cudaMalloc(&d_posY, m_maxParticles * sizeof(float));
+    cudaMalloc(&d_posZ, m_maxParticles * sizeof(float));
+
+    cudaMalloc(&d_predX, m_maxParticles * sizeof(float));
+    cudaMalloc(&d_predY, m_maxParticles * sizeof(float));
+    cudaMalloc(&d_predZ, m_maxParticles * sizeof(float));
+
+    cudaMalloc(&d_velX, m_maxParticles * sizeof(float));
+    cudaMalloc(&d_velY, m_maxParticles * sizeof(float));
+    cudaMalloc(&d_velZ, m_maxParticles * sizeof(float));
+
+    cudaMalloc(&d_sortedPredX, m_maxParticles * sizeof(float));
+    cudaMalloc(&d_sortedPredY, m_maxParticles * sizeof(float));
+    cudaMalloc(&d_sortedPredZ, m_maxParticles * sizeof(float));
+
+    cudaMalloc(&d_sortedVelX, m_maxParticles * sizeof(float));
+    cudaMalloc(&d_sortedVelY, m_maxParticles * sizeof(float));
+    cudaMalloc(&d_sortedVelZ, m_maxParticles * sizeof(float));
+
     cudaMalloc(&d_densities, m_maxParticles * sizeof(float));
     cudaMalloc(&d_nearDensities, m_maxParticles * sizeof(float));
     cudaMalloc(&d_spatialIndices, m_maxParticles * sizeof(uint32_t));
     cudaMalloc(&d_spatialKeys, m_maxParticles * sizeof(uint32_t));
     cudaMalloc(&d_startIndices, m_hashTableSize * sizeof(uint32_t));
     cudaMalloc(&d_colliders, 10 * sizeof(Collider));
+    cudaMalloc(&d_aos_temp, m_maxParticles * 3 * sizeof(float));
 }
 
 SPHSolver::~SPHSolver() {
-    if (d_positions) cudaFree(d_positions);
-    if (d_velocities) cudaFree(d_velocities);
+    for (const auto& col : m_colliders) {
+        if (col.type == TYPE_MESH) {
+            cudaDestroyTextureObject(col.sdfTexture);
+            cudaFreeArray(col.sdfArray);
+        }
+    }
+
+    if (d_posX) cudaFree(d_posX);
+    if (d_posY) cudaFree(d_posY);
+    if (d_posZ) cudaFree(d_posZ);
+    if (d_velX) cudaFree(d_velX);
+    if (d_velY) cudaFree(d_velY);
+    if (d_velZ) cudaFree(d_velZ);
 }
 
 void SPHSolver::init(const std::vector<float> &positions, const std::vector<float> &velocities) {
     m_numParticles = positions.size() / 3;
     if (m_numParticles > m_maxParticles) m_numParticles = m_maxParticles;
 
-    size_t copySize = m_numParticles * 3 * sizeof(float);
-    cudaMemcpy(d_positions, positions.data(), copySize, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_velocities, velocities.data(), copySize, cudaMemcpyHostToDevice);
+    std::vector<float> h_posX(m_numParticles);
+    std::vector<float> h_posY(m_numParticles);
+    std::vector<float> h_posZ(m_numParticles);
+
+    std::vector<float> h_velX(m_numParticles);
+    std::vector<float> h_velY(m_numParticles);
+    std::vector<float> h_velZ(m_numParticles);
+
+    for (int i = 0; i < m_numParticles; ++i) {
+        h_posX[i] = positions[i * 3 + 0];
+        h_posY[i] = positions[i * 3 + 1];
+        h_posZ[i] = positions[i * 3 + 2];
+
+        h_velX[i] = velocities[i * 3 + 0];
+        h_velY[i] = velocities[i * 3 + 1];
+        h_velZ[i] = velocities[i * 3 + 2];
+    }
+
+    size_t copySize = m_numParticles * sizeof(float);
+    cudaMemcpy(d_posX, h_posX.data(), copySize, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_posY, h_posY.data(), copySize, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_posZ, h_posZ.data(), copySize, cudaMemcpyHostToDevice);
+
+    cudaMemcpy(d_velX, h_velX.data(), copySize, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_velY, h_velY.data(), copySize, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_velZ, h_velZ.data(), copySize, cudaMemcpyHostToDevice);
 
     float h = m_params.smoothingRadius;
     float h5 = powf(h, 5.0f);
@@ -1234,59 +1123,59 @@ void SPHSolver::init(const std::vector<float> &positions, const std::vector<floa
 }
 
 void SPHSolver::update(float dt) {
-    int blockSize = 256;
+    int blockSize = 128;
     int numBlock = (m_numParticles + blockSize - 1) / blockSize;
 
     // Apply gravity and predict next positions
-    PredictPositions<<<numBlock, blockSize>>>(d_positions, d_predictedPositions, d_velocities,
+    PredictPositions<<<numBlock, blockSize>>>(
+        d_posX, d_posY, d_posZ,
+        d_predX, d_predY, d_predZ,
+        d_velX, d_velY, d_velZ,
         m_numParticles, m_params.gravity, dt);
-    // cudaDeviceSynchronize();
 
     UpdateSpatialLookup();
 
-    SortData<<<numBlock, blockSize>>>(m_numParticles, d_spatialIndices, d_predictedPositions, d_sortedPredictedPositions, d_velocities, d_sortedVelocities);
+    SortData<<<numBlock, blockSize>>>(m_numParticles, d_spatialIndices,
+        d_predX, d_predY, d_predZ,
+        d_sortedPredX, d_sortedPredY, d_sortedPredZ,
+        d_velX, d_velY, d_velZ,
+        d_sortedVelX, d_sortedVelY, d_sortedVelZ);
 
     // Calculate and apply densities
-    size_t smemDensity = blockSize * sizeof(float3);
-    // UpdateDensities<<<numBlock, blockSize>>>(d_predictedPositions, d_velocities, d_densities, d_nearDensities,
-    //     d_spatialIndices, d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
-    //     m_params.smoothingRadius, m_params.gravity, dt, m_params.densityScale, m_params.nearDensityScale);
-    UpdateDensities_Shared<<<numBlock, blockSize, smemDensity>>>(
-         d_sortedPredictedPositions,
-         d_spatialIndices, d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
+    size_t smemDensity = blockSize * 3 * sizeof(float);
+    UpdateDensities_Optimized<<<numBlock, blockSize, smemDensity>>>(
+         d_sortedPredX, d_sortedPredY, d_sortedPredZ,
+         d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
          m_params.smoothingRadius, m_params.densityScale, m_params.nearDensityScale,
          d_densities, d_nearDensities
      );
-    // cudaDeviceSynchronize();
 
     // Calculate and apply pressure forces
-    // ApplyPressureForces<<<numBlock, blockSize>>>(d_predictedPositions, d_velocities, d_densities, d_nearDensities,
-    //     d_spatialIndices, d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
-    //     m_params.smoothingRadius, m_params.targetDensity, m_params.pressureMultiplier, m_params.nearPressureMultiplier, m_params.viscosityStrength, dt, m_params.pressureScale, m_params.viscosityScale, m_params.nearPressureScale);
     size_t smemPressure = blockSize * 16 * sizeof(float);
     ApplyPressureForces_Optimized<<<numBlock, blockSize, smemPressure>>>(
-        d_sortedPredictedPositions, // Sorted
-        d_sortedVelocities,         // Sorted (This gets updated!)
-        d_densities,                // Calculated from sorted data (matches index)
-        d_nearDensities,            // Calculated from sorted data (matches index)
+        d_sortedPredX, d_sortedPredY, d_sortedPredZ,
+        d_sortedVelX, d_sortedVelY, d_sortedVelZ,
+        d_densities,
+        d_nearDensities,
         d_spatialIndices, d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
         m_params.smoothingRadius, m_params.targetDensity, m_params.pressureMultiplier,
         m_params.nearPressureMultiplier, m_params.viscosityStrength, dt,
         m_params.pressureScale, m_params.viscosityScale, m_params.nearPressureScale
     );
-    // cudaDeviceSynchronize();
 
-    ReorderVelocities<<<numBlock, blockSize>>>(m_numParticles, d_spatialIndices, d_sortedVelocities, d_velocities);
-    cudaDeviceSynchronize();
+    ReorderVelocities<<<numBlock, blockSize>>>(m_numParticles, d_spatialIndices,
+        d_sortedVelX, d_sortedVelY, d_sortedVelZ,
+        d_velX, d_velY, d_velZ);
 
     // Update positions and handle collisions
-    UpdatePositions<<<numBlock, blockSize>>>(d_positions, d_velocities, m_numParticles,
+    UpdatePositions<<<numBlock, blockSize>>>(
+        d_posX, d_posY, d_posZ,
+        d_velX, d_velY, d_velZ,
+        m_numParticles,
         m_params.particleSize, m_params.boundsX, m_params.boundsY, m_params.boundsZ,
         m_params.collisionDamping, m_params.gravity, dt, d_colliders, m_numColliders, m_params.smoothingRadius, m_params.colliderDragMultiplier);
-    // cudaDeviceSynchronize();
 
     IntegrateColliders<<<1, 32>>>(d_colliders, m_numColliders, m_params.boundsX, m_params.boundsY, m_params.boundsZ, m_params.gravity, dt);
-    // cudaDeviceSynchronize();
 
     ResolveColliderCollisions<<<1, m_numColliders>>>(d_colliders, m_numColliders);
     cudaDeviceSynchronize();
@@ -1306,8 +1195,12 @@ void SPHSolver::getColliders(std::vector<Collider> &outColliders) {
 }
 
 void SPHSolver::getPositions(float* outPositions) {
-    // cudaMemcpy(outPositions, d_positions, m_numParticles * 3 * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpyAsync(outPositions, d_positions, m_numParticles * 3 * sizeof(float), cudaMemcpyHostToDevice);
+    int blockSize = 256;
+    int numBlock = (m_numParticles + blockSize - 1) / blockSize;
+
+    soa_to_aos<<<numBlock, blockSize>>>(d_aos_temp, d_posX, d_posY, d_posZ, m_numParticles);
+
+    cudaMemcpyAsync(outPositions, d_aos_temp, m_numParticles * 3 * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
 void SPHSolver::setParams(const SPHParams &params) {
