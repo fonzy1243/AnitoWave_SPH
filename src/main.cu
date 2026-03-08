@@ -15,15 +15,236 @@
 #include <GLFW/glfw3native.h>
 #endif
 
-struct PosColorVertex {
-    float x, y, z;
-    uint32_t abgr;
-};
+#define TINYLOADER_IMPLEMENTATION
+#include <tiny_obj_loader.h>
+
+#define TINYGLTF_IMPLEMENTATION
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <tiny_gltf.h>
 
 struct ParticleInstance {
     float x, y, z, pad0;
     float r, g, b, a;
 };
+
+bool loadMeshRawData(const std::string& filepath,
+                     std::vector<std::array<double, 3>>& outVertices,
+                     std::vector<std::array<int, 3>>& outTriangles,
+                     std::vector<PosColorVertex>& outRenderVertices,
+                     std::vector<uint32_t>& outRenderIndices,
+                     float scale = 1.0f) {
+    std::string ext = filepath.substr(filepath.find_last_of('.') + 1);
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+    // Parse .obj
+    if (ext == "obj") {
+        tinyobj::ObjReaderConfig reader_config;
+        reader_config.triangulate = true;
+        tinyobj::ObjReader reader;
+
+        if (!reader.ParseFromFile(filepath, reader_config)) {
+            std::cerr << "TinyObjReader Error: " << reader.Error() << "\n";
+            return false;
+        }
+
+        auto& attrib = reader.GetAttrib();
+        auto& shapes = reader.GetShapes();
+        uint32_t indexOffset = 0;
+
+        for (size_t v = 0; v < attrib.vertices.size() / 3; v++) {
+            outVertices.push_back({
+                attrib.vertices[3*v+0] * scale,
+                attrib.vertices[3*v+1] * scale,
+                attrib.vertices[3*v+2] * scale
+            });
+            PosColorVertex rv = {
+                attrib.vertices[3*v+0] * scale,
+                attrib.vertices[3*v+1] * scale,
+                attrib.vertices[3*v+2] * scale,
+                0,0,0, 0xffaaaaaa
+            };
+
+            if (attrib.normals.size() > 3 * v + 2) {
+                rv.nx = attrib.normals[3*v+0]; rv.ny = attrib.normals[3*v+1]; rv.nz = attrib.normals[3*v+2];
+            }
+            outRenderVertices.push_back(rv);
+        }
+
+        for (const auto& shape : shapes) {
+            for (size_t i = 0; i < shape.mesh.indices.size(); i += 3) {
+                int i0 = shape.mesh.indices[i+0].vertex_index;
+                int i1 = shape.mesh.indices[i+1].vertex_index;
+                int i2 = shape.mesh.indices[i+2].vertex_index;
+
+                outTriangles.push_back({i0, i1, i2});
+                outRenderIndices.push_back(i0); outRenderIndices.push_back(i1); outRenderIndices.push_back(i2);
+            }
+        }
+        return true;
+    }
+    if (ext == "gltf" || ext == "glb") {
+        tinygltf::Model model;
+        tinygltf::TinyGLTF loader;
+        std::string err, warn;
+
+        bool ret = (ext == "glb") ? loader.LoadBinaryFromFile(&model, &err, &warn, filepath)
+                                  : loader.LoadASCIIFromFile(&model, &err, &warn, filepath);
+
+        if (!warn.empty()) std::cout << "GLTF Warn: " << warn << "\n";
+        if (!err.empty()) std::cerr << "GLTF Error: " << err << "\n";
+        if (!ret) return false;
+
+        // Iterate through all meshes and primitives in the GLTF
+        for (const auto& mesh : model.meshes) {
+            for (const auto& primitive : mesh.primitives) {
+
+                const tinygltf::Accessor& posAccessor = model.accessors[primitive.attributes.at("POSITION")];
+                const tinygltf::BufferView& posView = model.bufferViews[posAccessor.bufferView];
+                const tinygltf::Buffer& posBuffer = model.buffers[posView.buffer];
+                const float* positions = reinterpret_cast<const float*>(&posBuffer.data[posView.byteOffset + posAccessor.byteOffset]);
+
+                const float* normals = nullptr;
+                if (primitive.attributes.find("NORMAL") != primitive.attributes.end()) {
+                    const tinygltf::Accessor& normAccessor = model.accessors[primitive.attributes.at("NORMAL")];
+                    const tinygltf::BufferView& normView = model.bufferViews[normAccessor.bufferView];
+                    const tinygltf::Buffer& normBuffer = model.buffers[normView.buffer];
+                    normals = reinterpret_cast<const float*>(&normBuffer.data[normView.byteOffset + normAccessor.byteOffset]);
+                }
+
+                uint32_t vertexOffset = outVertices.size();
+
+                for (size_t i = 0; i < posAccessor.count; ++i) {
+                    outVertices.push_back({
+                        positions[i*3+0] * scale,
+                        positions[i*3+1] * scale,
+                        positions[i*3+2] * scale
+                    });
+
+                    PosColorVertex rv = {
+                        positions[i*3+0] * scale,
+                        positions[i*3+1] * scale,
+                        positions[i*3+2] * scale,
+                        0,0,0, 0xffaaaaaa
+                    };
+                    if (normals) {
+                        rv.nx = normals[i*3+0]; rv.ny = normals[i*3+1]; rv.nz = normals[i*3+2];
+                    }
+                    outRenderVertices.push_back(rv);
+                }
+
+                // --- Extract Indices ---
+                const tinygltf::Accessor& indAccessor = model.accessors[primitive.indices];
+                const tinygltf::BufferView& indView = model.bufferViews[indAccessor.bufferView];
+                const tinygltf::Buffer& indBuffer = model.buffers[indView.buffer];
+                const uint8_t* indexData = &indBuffer.data[indView.byteOffset + indAccessor.byteOffset];
+
+                for (size_t i = 0; i < indAccessor.count; i += 3) {
+                    int i0, i1, i2;
+                    // GLTF indices can be stored as 16-bit or 32-bit integers, we must handle both
+                    if (indAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
+                        const uint16_t* ind = reinterpret_cast<const uint16_t*>(indexData);
+                        i0 = ind[i+0]; i1 = ind[i+1]; i2 = ind[i+2];
+                    } else { // UNSIGNED_INT
+                        const uint32_t* ind = reinterpret_cast<const uint32_t*>(indexData);
+                        i0 = ind[i+0]; i1 = ind[i+1]; i2 = ind[i+2];
+                    }
+
+                    int vOffset = static_cast<int>(vertexOffset);
+                    outTriangles.push_back({vOffset + i0, vOffset + i1, vOffset + i2});
+                    outRenderIndices.push_back(vertexOffset + i0);
+                    outRenderIndices.push_back(vertexOffset + i1);
+                    outRenderIndices.push_back(vertexOffset + i2);
+                }
+            }
+        }
+        return true;
+    }
+}
+
+MeshSDFData generateSDFFromMesh(const std::string& filepath, int resolution = 64, float scale = 1.0f) {
+    MeshSDFData result = {};
+
+    std::vector<std::array<double, 3>> vertices;
+    std::vector<std::array<int, 3>> triangles;
+
+    if (!loadMeshRawData(filepath, vertices, triangles, result.renderVertices, result.renderIndices, scale)) {
+        return result;
+    }
+
+    std::cout << "Loaded mesh: " << vertices.size() << " vertices, " << triangles.size() << " triangles\n";
+
+    double minX = vertices[0][0], minY = vertices[0][1], minZ = vertices[0][2];
+    double maxX = vertices[0][0], maxY = vertices[0][1], maxZ = vertices[0][2];
+
+    for (const auto& v : vertices) {
+        minX = std::min(minX, v[0]); minY = std::min(minY, v[1]); minZ = std::min(minZ, v[2]);
+        maxX = std::max(maxX, v[0]); maxY = std::max(maxY, v[1]); maxZ = std::max(maxZ, v[2]);
+    }
+
+    double padding = 1.0;
+    minX -= padding; minY -= padding; minZ -= padding;
+    maxX += padding; maxY += padding; maxZ += padding;
+
+    result.minBounds = make_float3(static_cast<float>(minX), static_cast<float>(minY), static_cast<float>(minZ));
+    result.maxBounds = make_float3(static_cast<float>(maxX), static_cast<float>(maxY), static_cast<float>(maxZ));
+    result.resX = resolution; result.resY = resolution; result.resZ = resolution;
+
+    std::cout << "Generating SDF Voxel Grid...\n";
+    tmd::TriangleMeshDistance mesh_distance(vertices, triangles);
+
+    result.distanceData.resize(resolution * resolution * resolution);
+    for (int z = 0; z < resolution; ++z) {
+        for (int y = 0; y < resolution; ++y) {
+            for (int x = 0; x < resolution; ++x) {
+
+                double px = minX + x * (maxX - minX) / (resolution - 1);
+                double py = minY + y * (maxY - minY) / (resolution - 1);
+                double pz = minZ + z * (maxZ - minZ) / (resolution - 1);
+
+                tmd::Result dist_result = mesh_distance.signed_distance({px, py, pz});
+
+                int index = z * resolution * resolution + y * resolution + x;
+                result.distanceData[index] = static_cast<float>(dist_result.distance);
+            }
+        }
+    }
+
+    std::cout << "SDF Generation complete.\n";
+    return result;
+}
+
+void createSDFTextureObject(const MeshSDFData& sdfData, cudaTextureObject_t& outTex, cudaArray_t& outArray) {
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
+    cudaExtent extent = make_cudaExtent(sdfData.resX, sdfData.resY, sdfData.resZ);
+
+    cudaMalloc3DArray(&outArray, &channelDesc, extent);
+
+    cudaMemcpy3DParms copyParams = {};
+    copyParams.srcPtr = make_cudaPitchedPtr(
+        (void*)sdfData.distanceData.data(),
+        sdfData.resX * sizeof(float),
+        sdfData.resX, sdfData.resY
+    );
+    copyParams.dstArray = outArray;
+    copyParams.extent = extent;
+    copyParams.kind = cudaMemcpyHostToDevice;
+    cudaMemcpy3D(&copyParams);
+
+    cudaResourceDesc resDesc = {};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = outArray;
+
+    cudaTextureDesc texDesc = {};
+    texDesc.addressMode[0] = cudaAddressModeClamp;
+    texDesc.addressMode[1] = cudaAddressModeClamp;
+    texDesc.addressMode[2] = cudaAddressModeClamp;
+    texDesc.filterMode = cudaFilterModeLinear;
+    texDesc.readMode = cudaReadModeElementType;
+    texDesc.normalizedCoords = 1; // sample using [0.0, 1.0] UVW coords
+
+    cudaCreateTextureObject(&outTex, &resDesc, &texDesc, nullptr);
+}
 
 class AnitoWave {
 public:
@@ -97,6 +318,10 @@ private:
     bgfx::VertexBufferHandle m_cubeVB;
     bgfx::IndexBufferHandle m_cubeIB;
 
+    // Mesh rendering data
+    bgfx::VertexBufferHandle m_meshVB;
+    bgfx::IndexBufferHandle m_meshIB;
+
     // SPH particle data
     float* m_particlePositions = nullptr;
     std::vector<uint32_t> m_particleColors;
@@ -126,6 +351,7 @@ AnitoWave::~AnitoWave() {
 void AnitoWave::initParticleRendering() {
     m_particleLayout.begin()
         .add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float)
+        .add(bgfx::Attrib::Normal, 3, bgfx::AttribType::Float)
         .add(bgfx::Attrib::Color0, 4, bgfx::AttribType::Uint8, true)
         .end();
 
@@ -146,11 +372,27 @@ void AnitoWave::initParticleRendering() {
         BGFX_BUFFER_INDEX32
     );
 
-    int particlesPerSide = 80;
+    MeshSDFData customMesh = generateSDFFromMesh("meshes/seawolf.gltf", 64, 0.6);
+
+    m_meshVB = bgfx::createVertexBuffer(
+        bgfx::copy(customMesh.renderVertices.data(), customMesh.renderVertices.size() * sizeof(PosColorVertex)),
+        m_particleLayout
+    );
+
+    m_meshIB = bgfx::createIndexBuffer(
+        bgfx::copy(customMesh.renderIndices.data(), customMesh.renderIndices.size() * sizeof(uint32_t)),
+        BGFX_BUFFER_INDEX32
+    );
+
+    cudaTextureObject_t tex;
+    cudaArray_t arr;
+    createSDFTextureObject(customMesh, tex, arr);
+
+    int particlesPerSide = 50;
     int numParticles = particlesPerSide * particlesPerSide * particlesPerSide;
 
     float boundsX = 10.0f;
-    float boundsY = 10.0f;
+    float boundsY = 8.0f;
     float boundsZ = 10.0f;
 
     float maxSpacingX = boundsX / particlesPerSide;
@@ -204,6 +446,19 @@ void AnitoWave::initParticleRendering() {
 
     initColliderRendering();
 
+    Collider meshCol{};
+    meshCol.type = TYPE_MESH;
+    meshCol.isDynamic = true;
+    meshCol.mass = 55000.0f;
+    meshCol.position = make_float3(0.0f, 0.0f, 0.0f);
+    meshCol.velocity = make_float3(0.0f, 0.0f, 0.0f);
+    meshCol.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
+
+    meshCol.sdfTexture = tex;
+    meshCol.sdfArray = arr;
+    meshCol.gridMinBounds = customMesh.minBounds;
+    meshCol.gridMaxBounds = customMesh.maxBounds;
+
     // Add a Sphere at (0, 0, 0) with radius 1.0
     Collider sphere1{};
     sphere1.type = TYPE_SPHERE;
@@ -232,19 +487,28 @@ void AnitoWave::initParticleRendering() {
     sphere3.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
     sphere3.dims = make_float3(0.8f, 0.0f, 0.0f); // dims.x is radius
 
-    // Collider box1{};
-    // box1.type = TYPE_BOX;
-    // box1.isDynamic = true;
-    // box1.mass = 2050.0f;
-    // box1.position = make_float3(5.5f, 0.0f, 2.0f);
-    // box1.velocity = make_float3(0.0f, 0.0f, 0.0f);
-    // box1.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
-    // box1.dims = make_float3(0.6f, 0.3f, 0.6f); // dims.x is radius
+    Collider box1{};
+    box1.type = TYPE_BOX;
+    box1.isDynamic = true;
+    box1.mass = 1050.0f;
+    box1.position = make_float3(5.5f, 0.0f, -2.0f);
+    box1.velocity = make_float3(0.0f, 0.0f, 0.0f);
+    box1.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
+    box1.dims = make_float3(0.8f, 0.5f, 0.8f); // dims.x is radius
 
-    m_solver->addCollider(sphere1);
-    m_solver->addCollider(sphere2);
-    m_solver->addCollider(sphere3);
+    Collider box2{};
+    box2.type = TYPE_BOX;
+    box2.isDynamic = false;
+    box2.position = make_float3(-2.5f, 0.0f, -2.0f);
+    box2.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
+    box2.dims = make_float3(1.0f, 10.0f, 5.0f);
+
+    m_solver->addCollider(meshCol);
+    // m_solver->addCollider(sphere1);
+    // m_solver->addCollider(sphere2);
+    // m_solver->addCollider(sphere3);
     // m_solver->addCollider(box1);
+    // m_solver->addCollider(box2);
 
     m_particleRadius = m_solver->getParams().particleSize;
 }
@@ -269,7 +533,7 @@ void AnitoWave::generateSphereTemplate(int stacks, int slices) {
             float y = bx::cos(phi);
             float z = bx::sin(phi) * bx::sin(theta);
 
-            m_circleTemplate.push_back({x, y, z, 0xffffffff});
+            m_circleTemplate.push_back({x, y, z, x, y, z, 0xffffffff});
         }
     }
 
@@ -291,32 +555,54 @@ void AnitoWave::generateSphereTemplate(int stacks, int slices) {
 
 void AnitoWave::generateCubeTemplate() {
     PosColorVertex vertices[] = {
-        {-1.0f,  1.0f,  1.0f, 0xffffffff}, { 1.0f,  1.0f,  1.0f, 0xffffffff},
-        {-1.0f, -1.0f,  1.0f, 0xffffffff}, { 1.0f, -1.0f,  1.0f, 0xffffffff},
-        {-1.0f,  1.0f, -1.0f, 0xffffffff}, { 1.0f,  1.0f, -1.0f, 0xffffffff},
-        {-1.0f, -1.0f, -1.0f, 0xffffffff}, { 1.0f, -1.0f, -1.0f, 0xffffffff},
+        // Front face (Normal: 0, 0, 1)
+        {-1.0f,  1.0f,  1.0f,  0.0f, 0.0f, 1.0f, 0xffffffff},
+        { 1.0f,  1.0f,  1.0f,  0.0f, 0.0f, 1.0f, 0xffffffff},
+        {-1.0f, -1.0f,  1.0f,  0.0f, 0.0f, 1.0f, 0xffffffff},
+        { 1.0f, -1.0f,  1.0f,  0.0f, 0.0f, 1.0f, 0xffffffff},
+        // Back face (Normal: 0, 0, -1)
+        { 1.0f,  1.0f, -1.0f,  0.0f, 0.0f, -1.0f, 0xffffffff},
+        {-1.0f,  1.0f, -1.0f,  0.0f, 0.0f, -1.0f, 0xffffffff},
+        { 1.0f, -1.0f, -1.0f,  0.0f, 0.0f, -1.0f, 0xffffffff},
+        {-1.0f, -1.0f, -1.0f,  0.0f, 0.0f, -1.0f, 0xffffffff},
+        // Top face (Normal: 0, 1, 0)
+        {-1.0f,  1.0f, -1.0f,  0.0f, 1.0f, 0.0f, 0xffffffff},
+        { 1.0f,  1.0f, -1.0f,  0.0f, 1.0f, 0.0f, 0xffffffff},
+        {-1.0f,  1.0f,  1.0f,  0.0f, 1.0f, 0.0f, 0xffffffff},
+        { 1.0f,  1.0f,  1.0f,  0.0f, 1.0f, 0.0f, 0xffffffff},
+        // Bottom face (Normal: 0, -1, 0)
+        {-1.0f, -1.0f,  1.0f,  0.0f, -1.0f, 0.0f, 0xffffffff},
+        { 1.0f, -1.0f,  1.0f,  0.0f, -1.0f, 0.0f, 0xffffffff},
+        {-1.0f, -1.0f, -1.0f,  0.0f, -1.0f, 0.0f, 0xffffffff},
+        { 1.0f, -1.0f, -1.0f,  0.0f, -1.0f, 0.0f, 0xffffffff},
+        // Right face (Normal: 1, 0, 0)
+        { 1.0f,  1.0f,  1.0f,  1.0f, 0.0f, 0.0f, 0xffffffff},
+        { 1.0f,  1.0f, -1.0f,  1.0f, 0.0f, 0.0f, 0xffffffff},
+        { 1.0f, -1.0f,  1.0f,  1.0f, 0.0f, 0.0f, 0xffffffff},
+        { 1.0f, -1.0f, -1.0f,  1.0f, 0.0f, 0.0f, 0xffffffff},
+        // Left face (Normal: -1, 0, 0)
+        {-1.0f,  1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 0xffffffff},
+        {-1.0f,  1.0f,  1.0f, -1.0f, 0.0f, 0.0f, 0xffffffff},
+        {-1.0f, -1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 0xffffffff},
+        {-1.0f, -1.0f,  1.0f, -1.0f, 0.0f, 0.0f, 0xffffffff},
     };
 
     const uint32_t indices[] = {
-        0, 1, 2,
-        1, 3, 2,
-        4, 6, 5,
-        5, 6, 7,
-        0, 2, 4,
-        4, 2, 6,
-        1, 5, 3,
-        5, 7, 3,
-        0, 4, 1,
-        2, 3, 6,
-        6, 3, 7,
+        0,  2,  1,   1,  2,  3,    // Front  (Normal:  0,  0,  1)
+        4,  6,  5,   5,  6,  7,    // Back   (Normal:  0,  0, -1)
+        8,  10, 9,   9,  10, 11,   // Top    (Normal:  0,  1,  0)
+        12, 14, 13,  13, 14, 15,   // Bottom (Normal:  0, -1,  0)
+        16, 18, 17,  17, 19, 18,   // Right  (Normal:  1,  0,  0)
+        20, 22, 21,  21, 22, 23    // Left   (Normal: -1,  0,  0)
     };
 
     m_cubeVB = bgfx::createVertexBuffer(
-        bgfx::makeRef(vertices, sizeof(vertices)),
+        bgfx::copy(vertices, sizeof(vertices)),
         m_particleLayout
     );
     m_cubeIB = bgfx::createIndexBuffer(
-        bgfx::makeRef(indices, sizeof(indices))
+        bgfx::copy(indices, sizeof(indices)),
+        BGFX_BUFFER_INDEX32
     );
 }
 
@@ -425,18 +711,19 @@ void AnitoWave::renderColliders() {
         float mtxScale[16];
         if (col.type == TYPE_SPHERE) {
             bx::mtxScale(mtxScale, col.dims.x, col.dims.x, col.dims.x);
-
             bx::mtxMul(mtx, mtxScale, mtxTrans);
-
             bgfx::setVertexBuffer(0, m_circleVB);
             bgfx::setIndexBuffer(m_circleIB);
         } else if (col.type == TYPE_BOX) {
             bx::mtxScale(mtxScale, col.dims.x, col.dims.y, col.dims.z);
-
             bx::mtxMul(mtx, mtxScale, mtxTrans);
-
             bgfx::setVertexBuffer(0, m_cubeVB);
             bgfx::setIndexBuffer(m_cubeIB);
+        } else if (col.type == TYPE_MESH) {
+            bx::mtxScale(mtxScale, 1.0f, 1.0f, 1.0f);
+            bx::mtxMul(mtx, mtxScale, mtxTrans);
+            bgfx::setVertexBuffer(0, m_meshVB);
+            bgfx::setIndexBuffer(m_meshIB);
         }
 
         bgfx::setTransform(mtx);
