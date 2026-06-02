@@ -11,6 +11,7 @@ if (MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/arch:AVX512>)
 endif ()
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
@@ -201,9 +202,11 @@ add_dependencies(AnitoWave_SPH compile_shaders)
 # -----------------
 file(MAKE_DIRECTORY ${CMAKE_SOURCE_DIR}/meshes)
 
-add_custom_command(TARGET AnitoWave_SPH POST_BUILD
+add_custom_target(CopyMeshes
         COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/meshes"
         "$<TARGET_FILE_DIR:AnitoWave_SPH>/meshes"
         COMMENT "Copying meshes to output directory..."
 )
+
+add_dependencies(AnitoWave_SPH CopyMeshes)

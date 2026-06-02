@@ -5,12 +5,15 @@
     <mapping directory="$PROJECT_DIR$/bgfx" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/bimg" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/bx" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/cmake-build-debug-visual-studio-2022/_deps/tinygltf-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/cmake-build-debug-visual-studio-2022/_deps/tinyobjloader-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/cmake-build-debug-visual-studio-2022/_deps/trianglemeshdistance-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/cmake-build-release-visual-studio-2022/_deps/tinygltf-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/cmake-build-release-visual-studio-2022/_deps/tinyobjloader-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/cmake-build-release-visual-studio-2022/_deps/trianglemeshdistance-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug-visual-studio/_deps/tinygltf-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug-visual-studio/_deps/tinyobjloader-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug-visual-studio/_deps/trianglemeshdistance-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/tinygltf-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/tinyobjloader-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/trianglemeshdistance-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-release/_deps/tinygltf-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-release/_deps/tinyobjloader-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-release/_deps/trianglemeshdistance-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/glfw" vcs="Git" />
   </component>
 </project>

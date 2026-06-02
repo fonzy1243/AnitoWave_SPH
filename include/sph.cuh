@@ -57,11 +57,11 @@ struct SPHParams {
     float boundsX = 10.0f;
     float boundsY = 10.0f;
     float boundsZ = 10.0f;
-    float smoothingRadius = 0.15;
-    float targetDensity = 855.5f;
-    float pressureMultiplier = 150.0f;
+    float smoothingRadius = 0.25;
+    float targetDensity = 255.5f;
+    float pressureMultiplier = 250.0f;
     float viscosityStrength = 0.1f;
-    float nearPressureMultiplier = 0.1f;
+    float nearPressureMultiplier = 15.0f;
     float colliderDragMultiplier = 0.001f;
 
     float densityScale;        // For SmoothingKernel
