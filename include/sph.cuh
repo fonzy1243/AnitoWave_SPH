@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <numbers>
 #include <bx/math.h>
+#include <cub/cub.cuh>
 #include <thrust/sort.h>
 #include <thrust/device_ptr.h>
 
@@ -102,6 +103,7 @@ private:
 
     // Physical values
     float *d_posX, *d_posY, *d_posZ;
+    float *d_sortedPosX, *d_sortedPosY, *d_sortedPosZ;
     float *d_predX, *d_predY, *d_predZ;
     float *d_velX, *d_velY, *d_velZ;
     float* d_densities;
@@ -109,12 +111,18 @@ private:
     // Spatial hashing
     uint32_t* d_spatialIndices;
     uint32_t* d_spatialKeys;
+    uint32_t* d_spatialIndicesSorted;
+    uint32_t* d_spatialKeysSorted;
     uint32_t* d_startIndices;
     // Sorted buffers
     float *d_sortedPredX, *d_sortedPredY, *d_sortedPredZ;
     float *d_sortedVelX, *d_sortedVelY, *d_sortedVelZ;
     // AOS buffer for rendering
     float* d_aos_temp;
+
+    // For sorting
+    void* d_sortStorage = nullptr;
+    size_t m_sortStorageBytes = 0;
 };
 
 #endif //ANITOWAVE_SPH_SPH_CUH
