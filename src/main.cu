@@ -514,7 +514,7 @@ void AnitoWave::buildSceneList()
         empty.terrainSDFResolution = 64;
 
         empty.boundsX = 30.0f; empty.boundsY = 30.0; empty.boundsZ = 30.0f;
-        empty.particlesPerSide = 80;
+        empty.particlesPerSide = 90;
 
         empty.spawnOffsetX = 0.0f;
         empty.spawnOffsetY = 5.0f;
@@ -1191,8 +1191,8 @@ void AnitoWave::run() {
     double lastTime = glfwGetTime();
     double accumulator = 0.0f;
 
-    const float FIXED_DT = 1.0f / 120.0f;
-    const int MAX_STEPS_PER_FRAME = 3;
+    const float FIXED_DT = 1.0f / 360.0f;
+    const int MAX_STEPS_PER_FRAME = 13;
 
     while (!glfwWindowShouldClose(m_window)) {
         glfwPollEvents();
