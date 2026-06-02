@@ -412,7 +412,7 @@ __device__ float NearDensityDerivativeKernel(float dst, float radius, float scal
 }
 
 __global__
-__launch_bounds__(256, 2)
+// __launch_bounds__(256, 2)
 void ApplyPressureForces_Optimized(
     const float* __restrict__ predX,
     const float* __restrict__ predY,
@@ -982,6 +982,8 @@ __global__ void SortData(
     uint32_t* spatialIndices,
     float* posX, float* posY, float* posZ,
     float* sortedPosX, float* sortedPosY, float* sortedPosZ,
+    float* predX, float* predY, float* predZ,
+    float* sortedPredX, float* sortedPredY, float* sortedPredZ,
     float* velX, float* velY, float* velZ,
     float* sortedVelX, float* sortedVelY, float* sortedVelZ
 ) {
@@ -993,6 +995,10 @@ __global__ void SortData(
     sortedPosX[i] = posX[originalIndex];
     sortedPosY[i] = posY[originalIndex];
     sortedPosZ[i] = posZ[originalIndex];
+
+    sortedPredX[i] = predX[originalIndex];
+    sortedPredY[i] = predY[originalIndex];
+    sortedPredZ[i] = predZ[originalIndex];
 
     sortedVelX[i] = velX[originalIndex];
     sortedVelY[i] = velY[originalIndex];
@@ -1047,11 +1053,18 @@ void SPHSolver::UpdateSpatialLookup() {
 
     UpdateSpatialHash<<<numBlock, blockSize>>>(d_predX, d_predY, d_predZ, m_numParticles, m_hashTableSize, m_params.smoothingRadius, d_spatialIndices, d_spatialKeys, d_startIndices);
 
-    // Sort by cell key
-    thrust::device_ptr<uint32_t> t_keys(d_spatialKeys);
-    thrust::device_ptr<uint32_t> t_indices(d_spatialIndices);
+    if (d_sortStorage == nullptr)
+    {
+        cub::DeviceRadixSort::SortPairs(nullptr, m_sortStorageBytes, d_spatialKeys, d_spatialKeysSorted,
+            d_spatialIndices, d_spatialIndicesSorted, m_numParticles);
+        cudaMalloc(&d_sortStorage, m_sortStorageBytes);
+    }
 
-    thrust::sort_by_key(t_keys, t_keys + m_numParticles, t_indices);
+    cub::DeviceRadixSort::SortPairs(d_sortStorage, m_sortStorageBytes, d_spatialKeys, d_spatialKeysSorted,
+        d_spatialIndices, d_spatialIndicesSorted, m_numParticles);
+
+    std::swap(d_spatialKeys, d_spatialKeysSorted);
+    std::swap(d_spatialIndices, d_spatialIndicesSorted);
 
     UpdateStartIndices<<<numBlock, blockSize>>>(d_spatialKeys, d_startIndices, m_numParticles);
     cudaDeviceSynchronize();
@@ -1062,6 +1075,10 @@ SPHSolver::SPHSolver(int maxParticles) : m_maxParticles(maxParticles), m_numPart
     cudaMalloc(&d_posX, m_maxParticles * sizeof(float));
     cudaMalloc(&d_posY, m_maxParticles * sizeof(float));
     cudaMalloc(&d_posZ, m_maxParticles * sizeof(float));
+
+    cudaMalloc(&d_sortedPosX, m_maxParticles * sizeof(float));
+    cudaMalloc(&d_sortedPosY, m_maxParticles * sizeof(float));
+    cudaMalloc(&d_sortedPosZ, m_maxParticles * sizeof(float));
 
     cudaMalloc(&d_predX, m_maxParticles * sizeof(float));
     cudaMalloc(&d_predY, m_maxParticles * sizeof(float));
@@ -1081,8 +1098,13 @@ SPHSolver::SPHSolver(int maxParticles) : m_maxParticles(maxParticles), m_numPart
 
     cudaMalloc(&d_densities, m_maxParticles * sizeof(float));
     cudaMalloc(&d_nearDensities, m_maxParticles * sizeof(float));
+
     cudaMalloc(&d_spatialIndices, m_maxParticles * sizeof(uint32_t));
     cudaMalloc(&d_spatialKeys, m_maxParticles * sizeof(uint32_t));
+
+    cudaMalloc(&d_spatialIndicesSorted, m_maxParticles * sizeof(uint32_t));
+    cudaMalloc(&d_spatialKeysSorted, m_maxParticles * sizeof(uint32_t));
+
     cudaMalloc(&d_startIndices, m_hashTableSize * sizeof(uint32_t));
     cudaMalloc(&d_colliders, 10 * sizeof(Collider));
     cudaMalloc(&d_aos_temp, m_maxParticles * 3 * sizeof(float));
@@ -1099,6 +1121,9 @@ SPHSolver::~SPHSolver() {
     if (d_posX) cudaFree(d_posX);
     if (d_posY) cudaFree(d_posY);
     if (d_posZ) cudaFree(d_posZ);
+    if (d_sortedPosX) cudaFree(d_sortedPosX);
+    if (d_sortedPosY) cudaFree(d_sortedPosY);
+    if (d_sortedPosZ) cudaFree(d_sortedPosZ);
     if (d_velX) cudaFree(d_velX);
     if (d_velY) cudaFree(d_velY);
     if (d_velZ) cudaFree(d_velZ);
@@ -1112,6 +1137,9 @@ SPHSolver::~SPHSolver() {
     if (d_nearDensities) cudaFree(d_nearDensities);
     if (d_spatialIndices) cudaFree(d_spatialIndices);
     if (d_spatialKeys) cudaFree(d_spatialKeys);
+    if (d_spatialIndicesSorted) cudaFree(d_spatialIndicesSorted);
+    if (d_spatialKeysSorted) cudaFree(d_spatialKeysSorted);
+    if (d_sortStorage) cudaFree(d_sortStorage);
     if (d_startIndices) cudaFree(d_startIndices);
     if (d_aos_temp) cudaFree(d_aos_temp);
     if (d_colliders) cudaFree(d_colliders);
@@ -1162,7 +1190,7 @@ void SPHSolver::init(const std::vector<float> &positions, const std::vector<floa
 }
 
 void SPHSolver::update(float dt) {
-    int blockSize = 128;
+    int blockSize = 256;
     int numBlock = (m_numParticles + blockSize - 1) / blockSize;
 
     // Apply gravity and predict next positions
@@ -1174,16 +1202,28 @@ void SPHSolver::update(float dt) {
 
     UpdateSpatialLookup();
 
-    SortData<<<numBlock, blockSize>>>(m_numParticles, d_spatialIndices,
-        d_predX, d_predY, d_predZ,
-        d_sortedPredX, d_sortedPredY, d_sortedPredZ,
-        d_velX, d_velY, d_velZ,
-        d_sortedVelX, d_sortedVelY, d_sortedVelZ);
+    SortData<<<numBlock, blockSize>>>(
+        m_numParticles, d_spatialIndices,
+        d_posX, d_posY, d_posZ, d_sortedPosX, d_sortedPosY, d_sortedPosZ,
+        d_predX, d_predY, d_predZ, d_sortedPredX, d_sortedPredY, d_sortedPredZ,
+        d_velX, d_velY, d_velZ, d_sortedVelX, d_sortedVelY, d_sortedVelZ);
+
+    std::swap(d_posX, d_sortedPosX);
+    std::swap(d_posY, d_sortedPosY);
+    std::swap(d_posZ, d_sortedPosZ);
+
+    std::swap(d_predX, d_sortedPredX);
+    std::swap(d_predY, d_sortedPredY);
+    std::swap(d_predZ, d_sortedPredZ);
+
+    std::swap(d_velX, d_sortedVelX);
+    std::swap(d_velY, d_sortedVelY);
+    std::swap(d_velZ, d_sortedVelZ);
 
     // Calculate and apply densities
     size_t smemDensity = blockSize * 3 * sizeof(float);
     UpdateDensities_Optimized<<<numBlock, blockSize, smemDensity>>>(
-         d_sortedPredX, d_sortedPredY, d_sortedPredZ,
+         d_predX, d_predY, d_predZ,
          d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
          m_params.smoothingRadius, m_params.densityScale, m_params.nearDensityScale,
          d_densities, d_nearDensities
@@ -1192,8 +1232,8 @@ void SPHSolver::update(float dt) {
     // Calculate and apply pressure forces
     size_t smemPressure = blockSize * 16 * sizeof(float);
     ApplyPressureForces_Optimized<<<numBlock, blockSize, smemPressure>>>(
-        d_sortedPredX, d_sortedPredY, d_sortedPredZ,
-        d_sortedVelX, d_sortedVelY, d_sortedVelZ,
+        d_predX, d_predY, d_predZ,
+        d_velX, d_velY, d_velZ,
         d_densities,
         d_nearDensities,
         d_spatialIndices, d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
@@ -1202,9 +1242,9 @@ void SPHSolver::update(float dt) {
         m_params.pressureScale, m_params.viscosityScale, m_params.nearPressureScale
     );
 
-    ReorderVelocities<<<numBlock, blockSize>>>(m_numParticles, d_spatialIndices,
-        d_sortedVelX, d_sortedVelY, d_sortedVelZ,
-        d_velX, d_velY, d_velZ);
+    // ReorderVelocities<<<numBlock, blockSize>>>(m_numParticles, d_spatialIndices,
+    //     d_sortedVelX, d_sortedVelY, d_sortedVelZ,
+    //     d_velX, d_velY, d_velZ);
 
     // Update positions and handle collisions
     UpdatePositions<<<numBlock, blockSize>>>(
