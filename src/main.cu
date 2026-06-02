@@ -1,5 +1,10 @@
 #include <cstdio>
 #include <vector>
+#include <immintrin.h>
+#include <execution>
+#include <algorithm>
+#include <numeric>
+#include <cstdint>
 #include <imgui/imgui.h>
 #include <bx/bx.h>
 #include <bx/math.h>
@@ -28,6 +33,139 @@ struct ParticleInstance {
     float r, g, b, a;
 };
 
+void processGLTFNode(const tinygltf::Model& model, int nodeIndex, const float* parentMatrix,
+                     std::vector<std::array<double, 3>>& outVertices,
+                     std::vector<std::array<int, 3>>& outTriangles,
+                     std::vector<PosColorVertex>& outRenderVertices,
+                     std::vector<uint32_t>& outRenderIndices,
+                     float scale)
+{
+    const tinygltf::Node& node = model.nodes[nodeIndex];
+    float localMatrix[16];
+    bx::mtxIdentity(localMatrix);
+
+    if (node.matrix.size() == 16) {
+        for (int i = 0; i < 16; ++i) localMatrix[i] = static_cast<float>(node.matrix[i]);
+    } else {
+        float t[16], r[16], s[16];
+        bx::mtxIdentity(t); bx::mtxIdentity(r); bx::mtxIdentity(s);
+
+        if (node.translation.size() == 3) {
+            bx::mtxTranslate(t, (float)node.translation[0], (float)node.translation[1], (float)node.translation[2]);
+        }
+        if (node.rotation.size() == 4) {
+            bx::Quaternion quat = {
+                (float)node.rotation[0],
+                (float)node.rotation[1],
+                (float)node.rotation[2],
+                (float)node.rotation[3]
+            };
+
+            bx::mtxFromQuaternion(r, quat);
+        }
+        if (node.scale.size() == 3) {
+            bx::mtxScale(s, (float)node.scale[0], (float)node.scale[1], (float)node.scale[2]);
+        }
+
+        // TRS: Scale -> Rotate -> Translate
+        float temp[16];
+        bx::mtxMul(temp, s, r);
+        bx::mtxMul(localMatrix, temp, t);
+    }
+
+    float globalMatrix[16];
+    bx::mtxMul(globalMatrix, localMatrix, parentMatrix);
+
+    if (node.mesh >= 0) {
+        const tinygltf::Mesh& mesh = model.meshes[node.mesh];
+        for (const auto& primitive : mesh.primitives) {
+
+            const tinygltf::Accessor& posAccessor = model.accessors[primitive.attributes.at("POSITION")];
+            const tinygltf::BufferView& posView = model.bufferViews[posAccessor.bufferView];
+            const tinygltf::Buffer& posBuffer = model.buffers[posView.buffer];
+            const float* positions = reinterpret_cast<const float*>(&posBuffer.data[posView.byteOffset + posAccessor.byteOffset]);
+
+            const float* normals = nullptr;
+            if (primitive.attributes.find("NORMAL") != primitive.attributes.end()) {
+                const tinygltf::Accessor& normAccessor = model.accessors[primitive.attributes.at("NORMAL")];
+                const tinygltf::BufferView& normView = model.bufferViews[normAccessor.bufferView];
+                const tinygltf::Buffer& normBuffer = model.buffers[normView.buffer];
+                normals = reinterpret_cast<const float*>(&normBuffer.data[normView.byteOffset + normAccessor.byteOffset]);
+            }
+
+            uint32_t vertexOffset = outVertices.size();
+
+            for (size_t i = 0; i < posAccessor.count; ++i) {
+                float px = positions[i*3+0] * scale;
+                float py = positions[i*3+1] * scale;
+                float pz = positions[i*3+2] * scale;
+
+                float vx = px * globalMatrix[0] + py * globalMatrix[4] + pz * globalMatrix[8] + globalMatrix[12];
+                float vy = px * globalMatrix[1] + py * globalMatrix[5] + pz * globalMatrix[9] + globalMatrix[13];
+                float vz = px * globalMatrix[2] + py * globalMatrix[6] + pz * globalMatrix[10] + globalMatrix[14];
+
+                outVertices.push_back({(double)vx, (double)vy, (double)vz});
+
+                PosColorVertex rv = {vx, vy, vz, 0,0,0, 0xffaaaaaa};
+
+                if (normals) {
+                    float nx = normals[i*3+0];
+                    float ny = normals[i*3+1];
+                    float nz = normals[i*3+2];
+
+                    rv.nx = nx * globalMatrix[0] + ny * globalMatrix[4] + nz * globalMatrix[8];
+                    rv.ny = nx * globalMatrix[1] + ny * globalMatrix[5] + nz * globalMatrix[9];
+                    rv.nz = nx * globalMatrix[2] + ny * globalMatrix[6] + nz * globalMatrix[10];
+
+                    // normalize
+                    float len = std::sqrt(rv.nx*rv.nx + rv.ny*rv.ny + rv.nz*rv.nz);
+                    if (len > 0.0f) {
+                        rv.nx /= len; rv.ny /= len; rv.nz /= len;
+                    }
+                }
+                outRenderVertices.push_back(rv);
+            }
+
+            // --- Extract Indices ---
+            if (primitive.indices >= 0) {
+                const tinygltf::Accessor& indAccessor = model.accessors[primitive.indices];
+                const tinygltf::BufferView& indView = model.bufferViews[indAccessor.bufferView];
+                const tinygltf::Buffer& indBuffer = model.buffers[indView.buffer];
+                const uint8_t* indexData = &indBuffer.data[indView.byteOffset + indAccessor.byteOffset];
+
+                for (size_t i = 0; i < indAccessor.count; i += 3) {
+                    int i0, i1, i2;
+                    if (indAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
+                        const uint16_t* ind = reinterpret_cast<const uint16_t*>(indexData);
+                        i0 = ind[i+0]; i1 = ind[i+1]; i2 = ind[i+2];
+                    } else if (indAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
+                        const uint32_t* ind = reinterpret_cast<const uint32_t*>(indexData);
+                        i0 = ind[i+0]; i1 = ind[i+1]; i2 = ind[i+2];
+                    } else if (indAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
+                        const uint8_t* ind = indexData;
+                        i0 = ind[i+0]; i1 = ind[i+1]; i2 = ind[i+2];
+                    } else {
+                        continue;
+                    }
+                    int vOffset = static_cast<int>(vertexOffset);
+                    outTriangles.push_back({vOffset + i0, vOffset + i1, vOffset + i2});
+                    outRenderIndices.push_back(vertexOffset + i0); outRenderIndices.push_back(vertexOffset + i1); outRenderIndices.push_back(vertexOffset + i2);
+                }
+            } else {
+                for (size_t i = 0; i < posAccessor.count; i += 3) {
+                    int vOffset = static_cast<int>(vertexOffset);
+                    outTriangles.push_back({vOffset + (int)i, vOffset + (int)i + 1, vOffset + (int)i + 2});
+                    outRenderIndices.push_back(vertexOffset + (uint32_t)i); outRenderIndices.push_back(vertexOffset + (uint32_t)i + 1); outRenderIndices.push_back(vertexOffset + (uint32_t)i + 2);
+                }
+            }
+        }
+    }
+
+    for (int childIndex : node.children) {
+        processGLTFNode(model, childIndex, globalMatrix, outVertices, outTriangles, outRenderVertices, outRenderIndices, scale);
+    }
+}
+
 bool loadMeshRawData(const std::string& filepath,
                      std::vector<std::array<double, 3>>& outVertices,
                      std::vector<std::array<int, 3>>& outTriangles,
@@ -46,6 +184,9 @@ bool loadMeshRawData(const std::string& filepath,
         if (!reader.ParseFromFile(filepath, reader_config)) {
             std::cerr << "TinyObjReader Error: " << reader.Error() << "\n";
             return false;
+        }
+        if (!reader.Warning().empty()) {
+            std::cerr << "TinyObjReader Warning: " << reader.Warning() << "\n";
         }
 
         auto& attrib = reader.GetAttrib();
@@ -96,70 +237,83 @@ bool loadMeshRawData(const std::string& filepath,
         if (!ret) return false;
 
         // Iterate through all meshes and primitives in the GLTF
-        for (const auto& mesh : model.meshes) {
-            for (const auto& primitive : mesh.primitives) {
+        int sceneIndex = model.defaultScene > -1 ? model.defaultScene : 0;
+        const tinygltf::Scene& scene = model.scenes[sceneIndex];
 
-                const tinygltf::Accessor& posAccessor = model.accessors[primitive.attributes.at("POSITION")];
-                const tinygltf::BufferView& posView = model.bufferViews[posAccessor.bufferView];
-                const tinygltf::Buffer& posBuffer = model.buffers[posView.buffer];
-                const float* positions = reinterpret_cast<const float*>(&posBuffer.data[posView.byteOffset + posAccessor.byteOffset]);
+        float identity[16];
+        bx::mtxIdentity(identity);
 
-                const float* normals = nullptr;
-                if (primitive.attributes.find("NORMAL") != primitive.attributes.end()) {
-                    const tinygltf::Accessor& normAccessor = model.accessors[primitive.attributes.at("NORMAL")];
-                    const tinygltf::BufferView& normView = model.bufferViews[normAccessor.bufferView];
-                    const tinygltf::Buffer& normBuffer = model.buffers[normView.buffer];
-                    normals = reinterpret_cast<const float*>(&normBuffer.data[normView.byteOffset + normAccessor.byteOffset]);
-                }
-
-                uint32_t vertexOffset = outVertices.size();
-
-                for (size_t i = 0; i < posAccessor.count; ++i) {
-                    outVertices.push_back({
-                        positions[i*3+0] * scale,
-                        positions[i*3+1] * scale,
-                        positions[i*3+2] * scale
-                    });
-
-                    PosColorVertex rv = {
-                        positions[i*3+0] * scale,
-                        positions[i*3+1] * scale,
-                        positions[i*3+2] * scale,
-                        0,0,0, 0xffaaaaaa
-                    };
-                    if (normals) {
-                        rv.nx = normals[i*3+0]; rv.ny = normals[i*3+1]; rv.nz = normals[i*3+2];
-                    }
-                    outRenderVertices.push_back(rv);
-                }
-
-                // --- Extract Indices ---
-                const tinygltf::Accessor& indAccessor = model.accessors[primitive.indices];
-                const tinygltf::BufferView& indView = model.bufferViews[indAccessor.bufferView];
-                const tinygltf::Buffer& indBuffer = model.buffers[indView.buffer];
-                const uint8_t* indexData = &indBuffer.data[indView.byteOffset + indAccessor.byteOffset];
-
-                for (size_t i = 0; i < indAccessor.count; i += 3) {
-                    int i0, i1, i2;
-                    // GLTF indices can be stored as 16-bit or 32-bit integers, we must handle both
-                    if (indAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
-                        const uint16_t* ind = reinterpret_cast<const uint16_t*>(indexData);
-                        i0 = ind[i+0]; i1 = ind[i+1]; i2 = ind[i+2];
-                    } else { // UNSIGNED_INT
-                        const uint32_t* ind = reinterpret_cast<const uint32_t*>(indexData);
-                        i0 = ind[i+0]; i1 = ind[i+1]; i2 = ind[i+2];
-                    }
-
-                    int vOffset = static_cast<int>(vertexOffset);
-                    outTriangles.push_back({vOffset + i0, vOffset + i1, vOffset + i2});
-                    outRenderIndices.push_back(vertexOffset + i0);
-                    outRenderIndices.push_back(vertexOffset + i1);
-                    outRenderIndices.push_back(vertexOffset + i2);
-                }
-            }
+        for (int nodeIndex : scene.nodes)
+        {
+            processGLTFNode(model, nodeIndex, identity, outVertices, outTriangles, outRenderVertices, outRenderIndices, scale);
         }
         return true;
     }
+}
+
+static void precompute_coords_avx512(double* __restrict__ out, double minVal, double maxVal, int resolution) noexcept
+{
+    const double scale = (maxVal - minVal) / (resolution - 1);
+
+    __m512d vmin = _mm512_set1_pd(minVal);
+    __m512d vscale = _mm512_set1_pd(scale);
+
+    __m512d vbase = _mm512_set_pd(7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0);
+    __m512d vstep = _mm512_set1_pd(8.0);
+
+    int i = 0;
+    for (; i + 8 <= resolution; i += 8)
+    {
+        __m512d result = _mm512_fmadd_pd(vbase, vscale, vmin);
+        _mm512_storeu_pd(out + i, result);
+        vbase = _mm512_add_pd(vbase, vstep);
+    }
+
+    for (; i < resolution; ++i)
+    {
+        out[i] = minVal + i * scale;
+    }
+}
+
+void computeDistanceField(std::vector<float>& distanceData, const auto& mesh_distance,
+    double minX, double maxX,
+    double minY, double maxY,
+    double minZ, double maxZ,
+    int resolution)
+{
+    const int N = resolution;
+    const int N2 = N * N;
+    const int total = N * N * N;
+
+    distanceData.resize(total);
+
+    std::vector<double> xs(N), ys(N), zs(N);
+
+    precompute_coords_avx512(xs.data(), minX, maxX, N);
+    precompute_coords_avx512(ys.data(), minY, maxY, N);
+    precompute_coords_avx512(zs.data(), minZ, maxZ, N);
+
+    std::vector<int> z_indices(N);
+    std::iota(z_indices.begin(), z_indices.end(), 0);
+
+    std::for_each(std::execution::par_unseq, z_indices.begin(), z_indices.end(), [&](int z)
+    {
+        const double pz = zs[z];
+        const int z_off = z * N2;
+
+        for (int y = 0; y < N; ++y)
+        {
+            const double py = ys[y];
+            const int y_off = z_off + y * N;
+
+            for (int x = 0; x < N; ++x)
+            {
+                tmd::Result dist_result = mesh_distance.signed_distance({xs[x], py, pz});
+
+                distanceData[y_off + x] = static_cast<float>(dist_result.distance);
+            }
+        }
+    });
 }
 
 MeshSDFData generateSDFFromMesh(const std::string& filepath, int resolution = 64, float scale = 1.0f) {
@@ -193,22 +347,7 @@ MeshSDFData generateSDFFromMesh(const std::string& filepath, int resolution = 64
     std::cout << "Generating SDF Voxel Grid...\n";
     tmd::TriangleMeshDistance mesh_distance(vertices, triangles);
 
-    result.distanceData.resize(resolution * resolution * resolution);
-    for (int z = 0; z < resolution; ++z) {
-        for (int y = 0; y < resolution; ++y) {
-            for (int x = 0; x < resolution; ++x) {
-
-                double px = minX + x * (maxX - minX) / (resolution - 1);
-                double py = minY + y * (maxY - minY) / (resolution - 1);
-                double pz = minZ + z * (maxZ - minZ) / (resolution - 1);
-
-                tmd::Result dist_result = mesh_distance.signed_distance({px, py, pz});
-
-                int index = z * resolution * resolution + y * resolution + x;
-                result.distanceData[index] = static_cast<float>(dist_result.distance);
-            }
-        }
-    }
+    computeDistanceField(result.distanceData, mesh_distance, minX, maxX, minY, maxY, minZ, maxZ, resolution);
 
     std::cout << "SDF Generation complete.\n";
     return result;
@@ -246,6 +385,27 @@ void createSDFTextureObject(const MeshSDFData& sdfData, cudaTextureObject_t& out
     cudaCreateTextureObject(&outTex, &resDesc, &texDesc, nullptr);
 }
 
+struct SceneDef
+{
+    const char* name;
+
+    const char* terrainMeshPath;
+    float terrainScale;
+    int terrainSDFResolution;
+
+    float boundsX, boundsY, boundsZ;
+
+    int particlesPerSide;
+    float spawnOffsetX, spawnOffsetY, spawnOffsetZ;
+
+    float gravity;
+    float targetDensity;
+    float pressureMultiplier;
+    float viscosityStrength;
+
+    std::vector<Collider> extraColliders;
+};
+
 class AnitoWave {
 public:
     struct Config {
@@ -275,7 +435,7 @@ private:
     static void glfwMouseButtonCallback(GLFWwindow* window, int button, int action, int mods);
     static void glfwCursorPosCallback(GLFWwindow* window, double xpos, double ypos);
 
-    void initParticleRendering();
+    void initStaticRenderResources();
     void initColliderRendering();
     void renderParticles();
     void renderColliders();
@@ -283,6 +443,11 @@ private:
     void generateSphereTemplate(int stacks, int slices);
     void generateCubeTemplate();
     void updateCamera();
+
+    // Scene methods
+    void buildSceneList();
+    void loadScene(int index);
+    void unloadCurrentScene();
 
     Config m_config;
     GLFWwindow* m_window = nullptr;
@@ -292,6 +457,7 @@ private:
     bool m_showStats = false;
     bool m_showParamEditor = true;
     const bgfx::ViewId m_kClearView = 0;
+    int m_activeScene = 0;
 
     // Camera
     float m_cameraDistance = 10.0f;
@@ -322,14 +488,291 @@ private:
     bgfx::VertexBufferHandle m_meshVB;
     bgfx::IndexBufferHandle m_meshIB;
 
+    // Per-scene bgfx handles
+    bgfx::VertexBufferHandle m_terrainVB = BGFX_INVALID_HANDLE;
+    bgfx::IndexBufferHandle m_terrainIB = BGFX_INVALID_HANDLE;
+
     // SPH particle data
     float* m_particlePositions = nullptr;
     std::vector<uint32_t> m_particleColors;
     float m_particleRadius = 0.1f;
 
+    // Scene list
+    std::vector<SceneDef> m_scenes;
+
     // SPH class
     SPHSolver* m_solver = nullptr;
 };
+
+void AnitoWave::buildSceneList()
+{
+    {
+        SceneDef empty{};
+        empty.name = "Empty";
+        empty.terrainMeshPath = "";
+        empty.terrainScale = 1.0f;
+        empty.terrainSDFResolution = 64;
+
+        empty.boundsX = 30.0f; empty.boundsY = 30.0; empty.boundsZ = 30.0f;
+        empty.particlesPerSide = 80;
+
+        empty.spawnOffsetX = 0.0f;
+        empty.spawnOffsetY = 5.0f;
+        empty.spawnOffsetZ = 0.0f;
+
+        empty.gravity = 0;
+        empty.targetDensity = 650.0f;
+        empty.pressureMultiplier = 150.0f;
+        empty.viscosityStrength = 1.0f;
+
+        m_scenes.push_back(empty);
+    }
+
+    {
+        SceneDef calcata{};
+        calcata.name = "Calcata";
+        calcata.terrainMeshPath = "meshes/calcata.glb";
+        calcata.terrainScale = 1.0f;
+        calcata.terrainSDFResolution = 64;
+        calcata.boundsX = 15.0f; calcata.boundsY = 50.0f; calcata.boundsZ = 15.0f;
+        calcata.particlesPerSide = 50;
+        calcata.spawnOffsetY = 15.0f;
+        calcata.gravity = 0.f;
+        calcata.targetDensity = 650.0f;
+        calcata.pressureMultiplier = 150.0f;
+        calcata.viscosityStrength = 1.0f;
+        m_scenes.push_back(calcata);
+    }
+
+    {
+        SceneDef mountains{};
+        mountains.name = "Mountains";
+        mountains.terrainMeshPath = "meshes/Mountains.glb";
+        mountains.terrainScale = 10.0f;
+        mountains.terrainSDFResolution = 108;
+        mountains.boundsX = 15.0f; mountains.boundsY = 50.0f; mountains.boundsZ = 15.0f;
+        mountains.particlesPerSide = 50;
+        mountains.spawnOffsetY = 15.0f;
+        mountains.gravity = 0.f;
+        mountains.targetDensity = 650.0f;
+        mountains.pressureMultiplier = 150.0f;
+        mountains.viscosityStrength = 1.0f;
+        m_scenes.push_back(mountains);
+    }
+
+    {
+        SceneDef hohenzollern{};
+        hohenzollern.name = "Hohenzollern";
+        hohenzollern.terrainMeshPath = "meshes/Hohenzollern.glb";
+        hohenzollern.terrainScale = 1.0f;
+        hohenzollern.terrainSDFResolution = 64;
+        hohenzollern.boundsX = 15.0f; hohenzollern.boundsY = 50.0f; hohenzollern.boundsZ = 15.0f;
+        hohenzollern.particlesPerSide = 50;
+        hohenzollern.spawnOffsetY = 15.0f;
+        hohenzollern.gravity = 0.f;
+        hohenzollern.targetDensity = 650.0f;
+        hohenzollern.pressureMultiplier = 150.0f;
+        hohenzollern.viscosityStrength = 1.0f;
+        m_scenes.push_back(hohenzollern);
+    }
+
+    {
+        SceneDef sponza{};
+        sponza.name = "Sponza";
+        sponza.terrainMeshPath = "meshes/sponza/Sponza.gltf";
+        sponza.terrainScale = 1.0f;
+        sponza.terrainSDFResolution = 64;
+        sponza.boundsX = 15.0f; sponza.boundsY = 70.0f; sponza.boundsZ = 15.0f;
+        sponza.particlesPerSide = 50;
+        sponza.spawnOffsetY = 25.0f;
+        sponza.gravity = 0.f;
+        sponza.targetDensity = 650.0f;
+        sponza.pressureMultiplier = 150.0f;
+        sponza.viscosityStrength = 1.0f;
+        m_scenes.push_back(sponza);
+    }
+
+    {
+        SceneDef virtual_city{};
+        virtual_city.name = "Virtual City";
+        virtual_city.terrainMeshPath = "meshes/VirtualCity.glb";
+        virtual_city.terrainScale = 1.0f;
+        virtual_city.terrainSDFResolution = 64;
+        virtual_city.boundsX = 15.0f; virtual_city.boundsY = 70.0f; virtual_city.boundsZ = 15.0f;
+        virtual_city.particlesPerSide = 50;
+        virtual_city.spawnOffsetY = 25.0f;
+        virtual_city.gravity = 0.f;
+        virtual_city.targetDensity = 650.0f;
+        virtual_city.pressureMultiplier = 150.0f;
+        virtual_city.viscosityStrength = 1.0f;
+        m_scenes.push_back(virtual_city);
+    }
+
+    {
+        SceneDef alien{};
+        alien.name = "Alien Terrain";
+        alien.terrainMeshPath = "meshes/alien.glb";
+        alien.terrainScale = 10.0f;
+        alien.terrainSDFResolution = 64;
+        alien.boundsX = 15.0f; alien.boundsY = 70.0f; alien.boundsZ = 15.0f;
+        alien.particlesPerSide = 50;
+        alien.spawnOffsetY = 15.0f;
+        alien.gravity = 0.f;
+        alien.targetDensity = 650.0f;
+        alien.pressureMultiplier = 150.0f;
+        alien.viscosityStrength = 1.0f;
+        m_scenes.push_back(alien);
+    }
+
+    // {
+    //     SceneDef abg{};
+    //     abg.name = "A Beautiful Game";
+    //     abg.terrainMeshPath = "meshes/ABeautifulGame.glb";
+    //     abg.terrainScale = 1.0f;
+    //     abg.terrainSDFResolution = 64;
+    //     abg.boundsX = 15.0f; abg.boundsY = 50.0f; abg.boundsZ = 15.0f;
+    //     abg.particlesPerSide = 50;
+    //     abg.spawnOffsetY = 15.0f;
+    //     abg.gravity = 0.f;
+    //     abg.targetDensity = 650.0f;
+    //     abg.pressureMultiplier = 150.0f;
+    //     abg.viscosityStrength = 1.0f;
+    //     m_scenes.push_back(abg);
+    // }
+}
+
+void AnitoWave::unloadCurrentScene()
+{
+    delete m_solver;
+    m_solver = nullptr;
+
+    if (bgfx::isValid(m_terrainVB)) { bgfx::destroy(m_terrainVB); m_terrainVB = BGFX_INVALID_HANDLE; }
+    if (bgfx::isValid(m_terrainIB)) { bgfx::destroy(m_terrainIB); m_terrainIB = BGFX_INVALID_HANDLE; }
+
+    if (m_particlePositions) { cudaFreeHost(m_particlePositions); m_particlePositions = nullptr; }
+}
+
+void AnitoWave::loadScene(int index)
+{
+    if (index < 0 || index >= (int)m_scenes.size())
+    {
+        fprintf(stderr, "loadScene: index %d out of range\n", index);
+        return;
+    }
+
+    unloadCurrentScene();
+
+    const SceneDef& scene = m_scenes[index];
+    std::cout << "Loading scene " << scene.name << std::endl;
+
+    bool hasTerrain = (scene.terrainMeshPath != nullptr && scene.terrainMeshPath[0] != '\0');
+
+    MeshSDFData terrainData;
+    cudaTextureObject_t terrainTex = 0;
+    cudaArray_t terrainArr = nullptr;
+
+    if (hasTerrain)
+    {
+        terrainData = generateSDFFromMesh(scene.terrainMeshPath, scene.terrainSDFResolution, scene.terrainScale);
+
+        if (terrainData.distanceData.empty())
+        {
+            fprintf(stderr, "loadScene: terrain SDF generation failed for '%s'\n", scene.name);
+            return;
+        }
+
+        m_terrainVB = bgfx::createVertexBuffer(
+            bgfx::copy(terrainData.renderVertices.data(), terrainData.renderVertices.size() * sizeof(PosColorVertex)),
+            m_particleLayout
+        );
+
+        m_terrainIB = bgfx::createIndexBuffer(
+            bgfx::copy(terrainData.renderIndices.data(),terrainData.renderIndices.size() * sizeof(uint32_t)),
+            BGFX_BUFFER_INDEX32
+        );
+
+        createSDFTextureObject(terrainData, terrainTex, terrainArr);
+    }
+
+    const int N = scene.particlesPerSide;
+
+    const float spawnFraction = 0.6f;
+    const float spawnRangeX   = scene.boundsX * spawnFraction;
+    const float spawnRangeY   = scene.boundsY * spawnFraction;
+    const float spawnRangeZ   = scene.boundsZ * spawnFraction;
+
+    const float spacing = bx::min(spawnRangeX / N,
+                      bx::min(spawnRangeY / N,
+                              spawnRangeZ / N)) * 0.95f;
+
+    const float startX = scene.spawnOffsetX - ((N - 1) * spacing) * 0.5f;
+    const float startY = scene.spawnOffsetY - ((N - 1) * spacing) * 0.5f;
+    const float startZ = scene.spawnOffsetZ - ((N - 1) * spacing) * 0.5f;
+
+    std::vector<float> tempPositions;
+    std::vector<uint32_t> tempColors;
+
+    for (int pz = 0; pz < N; ++pz) {
+        for (int py = 0; py < N; ++py) {
+            for (int px = 0; px < N; ++px) {
+                float jitterX = ((rand() % 100) / 100.0f - 0.5f) * 0.02f;
+                float jitterY = ((rand() % 100) / 100.0f - 0.5f) * 0.02f;
+                float jitterZ = ((rand() % 100) / 100.0f - 0.5f) * 0.02f;
+
+                tempPositions.push_back(startX + px * spacing + jitterX);
+                tempPositions.push_back(startY + py * spacing + jitterY);
+                tempPositions.push_back(startZ + pz * spacing + jitterZ);
+                tempColors.push_back(0xffff0000); // Red fluid
+            }
+        }
+    }
+
+    int totalParticles = tempPositions.size() / 3;
+
+    const size_t posByteSize = totalParticles * 3 * sizeof(float);
+    if (cudaMallocHost((void**)&m_particlePositions, posByteSize) != cudaSuccess) {
+        fprintf(stderr, "loadScene: cudaMallocHost failed\n");
+        return;
+    }
+
+    memcpy(m_particlePositions, tempPositions.data(), posByteSize);
+    m_particleColors = tempColors;
+
+    m_solver = new SPHSolver(totalParticles);
+    {
+        SPHParams p;
+        p.boundsX = scene.boundsX;
+        p.boundsY = scene.boundsY;
+        p.boundsZ = scene.boundsZ;
+        p.gravity = scene.gravity;
+        p.targetDensity = scene.targetDensity;
+        p.pressureMultiplier = scene.pressureMultiplier;
+        p.viscosityStrength = scene.viscosityStrength;
+        m_solver->setParams(p);
+    }
+
+    std::vector<float> initVelocities(totalParticles * 3, 0.0f);
+    m_solver->init(tempPositions, initVelocities);
+
+    if (hasTerrain) {
+        Collider terrainCol{};
+        terrainCol.type             = TYPE_MESH;
+        terrainCol.isDynamic        = false;
+        terrainCol.mass             = 0.0f;
+        terrainCol.position         = make_float3(0.0f, 0.0f, 0.0f);
+        terrainCol.velocity         = make_float3(0.0f, 0.0f, 0.0f);
+        terrainCol.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
+        terrainCol.sdfTexture       = terrainTex;
+        terrainCol.sdfArray         = terrainArr;
+        terrainCol.gridMinBounds    = terrainData.minBounds;
+        terrainCol.gridMaxBounds    = terrainData.maxBounds;
+        terrainCol.voxelSize        = make_float3(
+            (terrainData.maxBounds.x - terrainData.minBounds.x) / (terrainData.resX - 1),
+            (terrainData.maxBounds.y - terrainData.minBounds.y) / (terrainData.resY - 1),
+            (terrainData.maxBounds.z - terrainData.minBounds.z) / (terrainData.resZ - 1));
+        m_solver->addCollider(terrainCol);
+    }
+}
 
 AnitoWave::AnitoWave(const Config &config) : m_config(config), m_width(config.width), m_height(config.height) {
 }
@@ -348,7 +791,7 @@ AnitoWave::~AnitoWave() {
     }
 }
 
-void AnitoWave::initParticleRendering() {
+void AnitoWave::initStaticRenderResources() {
     m_particleLayout.begin()
         .add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float)
         .add(bgfx::Attrib::Normal, 3, bgfx::AttribType::Float)
@@ -361,156 +804,20 @@ void AnitoWave::initParticleRendering() {
         .end();
 
     generateSphereTemplate(12, 32);
-
     m_circleVB = bgfx::createVertexBuffer(
         bgfx::makeRef(m_circleTemplate.data(), static_cast<uint32_t>(m_circleTemplate.size() * sizeof(PosColorVertex))),
         m_particleLayout
     );
-
     m_circleIB = bgfx::createIndexBuffer(
         bgfx::makeRef(m_circleIndices.data(), static_cast<uint32_t>(m_circleIndices.size() * sizeof(uint32_t))),
         BGFX_BUFFER_INDEX32
     );
 
-    MeshSDFData customMesh = generateSDFFromMesh("meshes/seawolf.gltf", 64, 0.6);
-
-    m_meshVB = bgfx::createVertexBuffer(
-        bgfx::copy(customMesh.renderVertices.data(), customMesh.renderVertices.size() * sizeof(PosColorVertex)),
-        m_particleLayout
-    );
-
-    m_meshIB = bgfx::createIndexBuffer(
-        bgfx::copy(customMesh.renderIndices.data(), customMesh.renderIndices.size() * sizeof(uint32_t)),
-        BGFX_BUFFER_INDEX32
-    );
-
-    cudaTextureObject_t tex;
-    cudaArray_t arr;
-    createSDFTextureObject(customMesh, tex, arr);
-
-    int particlesPerSide = 50;
-    int numParticles = particlesPerSide * particlesPerSide * particlesPerSide;
-
-    float boundsX = 10.0f;
-    float boundsY = 8.0f;
-    float boundsZ = 10.0f;
-
-    float maxSpacingX = boundsX / particlesPerSide;
-    float maxSpacingY = boundsY / particlesPerSide;
-    float maxSpacingZ = boundsZ / particlesPerSide;
-
-    float spacing = bx::min(m_particleRadius * 2.0f, bx::min(maxSpacingX, bx::min(maxSpacingY, maxSpacingZ))) * 0.95f;;
-    float startX = -((particlesPerSide - 1) * spacing) / 2.0f;
-    float startY = -((particlesPerSide - 1) * spacing) / 2.0f;
-    float startZ = -((particlesPerSide - 1) * spacing) / 2.0f;
-
-    size_t dataSize = numParticles * 3 * sizeof(float);
-    cudaMallocHost((void**)&m_particlePositions, dataSize);
-
-    if (!m_particlePositions) {
-        fprintf(stderr, "Failed to allocate pinned memory.\n");
-        return;
-    }
-
-    m_particleColors.reserve(numParticles);
-
-    for (int z = 0; z < particlesPerSide; ++z) {
-        for (int y = 0; y < particlesPerSide; ++y) {
-            for (int x = 0; x < particlesPerSide; ++x) {
-                float px = startX + x * spacing;
-                float py = startY + y * spacing;
-                float pz = startZ + z * spacing;
-
-                int index = (z * particlesPerSide * particlesPerSide + y * particlesPerSide + x) * 3;
-                m_particlePositions[index + 0] = px;
-                m_particlePositions[index + 1] = py;
-                m_particlePositions[index + 2] = pz;
-
-                m_particleColors.push_back(0xffff0000);
-            }
-        }
-    }
-
-    // Init SPH particles
-
-    m_solver = new SPHSolver(numParticles);
-
-    const std::vector initVelocities(numParticles * 3, 0.0f);
+    initColliderRendering();
 
     m_program = loadProgram("vs_particles", "fs_particles");
 
     m_particleRadiusUniform = bgfx::createUniform("u_particleRadius", bgfx::UniformType::Vec4);
-
-    std::vector tempPos(m_particlePositions, m_particlePositions + numParticles * 3);
-    m_solver->init(tempPos, initVelocities);
-
-    initColliderRendering();
-
-    Collider meshCol{};
-    meshCol.type = TYPE_MESH;
-    meshCol.isDynamic = true;
-    meshCol.mass = 55000.0f;
-    meshCol.position = make_float3(0.0f, 0.0f, 0.0f);
-    meshCol.velocity = make_float3(0.0f, 0.0f, 0.0f);
-    meshCol.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
-
-    meshCol.sdfTexture = tex;
-    meshCol.sdfArray = arr;
-    meshCol.gridMinBounds = customMesh.minBounds;
-    meshCol.gridMaxBounds = customMesh.maxBounds;
-
-    // Add a Sphere at (0, 0, 0) with radius 1.0
-    Collider sphere1{};
-    sphere1.type = TYPE_SPHERE;
-    sphere1.isDynamic = true;
-    sphere1.mass = 5050.0f;
-    sphere1.position = make_float3(0.0f, 0.0f, 0.0f);
-    sphere1.velocity = make_float3(0.0f, 0.0f, 0.0f);
-    sphere1.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
-    sphere1.dims = make_float3(1.0f, 0.0f, 0.0f); // dims.x is radius
-
-    Collider sphere2{};
-    sphere2.type = TYPE_SPHERE;
-    sphere2.isDynamic = true;
-    sphere2.mass = 1050.0f;
-    sphere2.position = make_float3(5.5f, 0.0f, 2.0f);
-    sphere2.velocity = make_float3(0.0f, 0.0f, 0.0f);
-    sphere2.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
-    sphere2.dims = make_float3(0.6f, 0.0f, 0.0f); // dims.x is radius
-
-    Collider sphere3{};
-    sphere3.type = TYPE_SPHERE;
-    sphere3.isDynamic = true;
-    sphere3.mass = 2050.0f;
-    sphere3.position = make_float3(-5.5f, 0.0f, 2.0f);
-    sphere3.velocity = make_float3(0.0f, 0.0f, 0.0f);
-    sphere3.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
-    sphere3.dims = make_float3(0.8f, 0.0f, 0.0f); // dims.x is radius
-
-    Collider box1{};
-    box1.type = TYPE_BOX;
-    box1.isDynamic = true;
-    box1.mass = 1050.0f;
-    box1.position = make_float3(5.5f, 0.0f, -2.0f);
-    box1.velocity = make_float3(0.0f, 0.0f, 0.0f);
-    box1.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
-    box1.dims = make_float3(0.8f, 0.5f, 0.8f); // dims.x is radius
-
-    Collider box2{};
-    box2.type = TYPE_BOX;
-    box2.isDynamic = false;
-    box2.position = make_float3(-2.5f, 0.0f, -2.0f);
-    box2.forceAccumulator = make_float3(0.0f, 0.0f, 0.0f);
-    box2.dims = make_float3(1.0f, 10.0f, 5.0f);
-
-    m_solver->addCollider(meshCol);
-    // m_solver->addCollider(sphere1);
-    // m_solver->addCollider(sphere2);
-    // m_solver->addCollider(sphere3);
-    // m_solver->addCollider(box1);
-    // m_solver->addCollider(box2);
-
-    m_particleRadius = m_solver->getParams().particleSize;
 }
 
 void AnitoWave::initColliderRendering() {
@@ -722,8 +1029,8 @@ void AnitoWave::renderColliders() {
         } else if (col.type == TYPE_MESH) {
             bx::mtxScale(mtxScale, 1.0f, 1.0f, 1.0f);
             bx::mtxMul(mtx, mtxScale, mtxTrans);
-            bgfx::setVertexBuffer(0, m_meshVB);
-            bgfx::setIndexBuffer(m_meshIB);
+            bgfx::setVertexBuffer(0, m_terrainVB);
+            bgfx::setIndexBuffer(m_terrainIB);
         }
 
         bgfx::setTransform(mtx);
@@ -784,9 +1091,9 @@ void AnitoWave::renderImGui() {
             ImGui::Separator();
             ImGui::Text("Collision");
             ImGui::SliderFloat("Collision Damping", &params.collisionDamping, 0.0f, 1.0f);
-            ImGui::SliderFloat("Bounds X", &params.boundsX, 1.0f, 30.0f);
-            ImGui::SliderFloat("Bounds Y", &params.boundsY, 1.0f, 30.0f);
-            ImGui::SliderFloat("Bounds Z", &params.boundsZ, 1.0f, 50.0f);
+            ImGui::SliderFloat("Bounds X", &params.boundsX, 1.0f, 80.0f);
+            ImGui::SliderFloat("Bounds Y", &params.boundsY, 1.0f, 80.0f);
+            ImGui::SliderFloat("Bounds Z", &params.boundsZ, 1.0f, 80.0f);
 
             ImGui::Separator();
             ImGui::Text("Colliders");
@@ -795,6 +1102,27 @@ void AnitoWave::renderImGui() {
             ImGui::Separator();
             if (ImGui::Button("Reset to Defaults")) {
                 params = SPHParams();
+            }
+        }
+        ImGui::End();
+
+        ImGui::SetNextWindowPos(ImVec2(10, 430), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(220, 160), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Scenes"))
+        {
+            for (int i = 0; i < (int)m_scenes.size(); i++)
+            {
+                bool selected = (i == m_activeScene);
+                if (ImGui::Selectable(m_scenes[i].name, selected))
+                {
+                    if (i != m_activeScene)
+                    {
+                        m_activeScene = i;
+                        bgfx::frame();
+                        cudaDeviceSynchronize();
+                        loadScene(i);
+                    }
+                }
             }
         }
         ImGui::End();
@@ -849,7 +1177,11 @@ bool AnitoWave::init() {
 
     imguiCreate();
 
-    initParticleRendering();
+    initStaticRenderResources();
+
+    buildSceneList();
+    loadScene(0);
+
     updateCamera();
 
     return true;

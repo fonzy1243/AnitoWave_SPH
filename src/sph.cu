@@ -319,6 +319,8 @@ __device__ float3 CalculateColliderNormal(float3 p, Collider c) {
         n = make_float3(x, y, z);
     }
 
+    float len = length(n);
+    if (len < 1e-6f) return make_float3(0, 1, 0);
     return n / length(n);
 }
 
@@ -392,7 +394,8 @@ __device__ float SmoothingKernelDerivative(float dst, float radius, float scale)
 
 __device__ float ViscositySmoothingKernel(float dst, float radius, float scale) {
     if (dst >= radius) return 0.0f;
-    float v = radius * radius - dst * dst;
+    // float v = radius * radius - dst * dst;
+    float v = radius - dst;
     return v * v * v * scale;
 }
 
@@ -465,13 +468,15 @@ void ApplyPressureForces_Optimized(
     s_velZ[tid] = myVel.z;
     s_den [tid] = myDensity;
     s_nden[tid] = myNearDensity;
+
     __syncthreads();
+
+    if (i >= numParticles) return;
 
     float3 pressureForce  = make_float3(0.f, 0.f, 0.f);
     float3 viscosityForce = make_float3(0.f, 0.f, 0.f);
     const float sqrRadius = smoothingRadius * smoothingRadius;
 
-    if (i >= numParticles) return;
 
     // After the Morton-code sort, particles in the same block are
     // spatially clustered and are each other's most likely neighbors.
@@ -487,7 +492,7 @@ void ApplyPressureForces_Optimized(
             float3 offset   = otherPos - samplePos;
             float  sqrDst   = lengthSqr(offset);
 
-            if (sqrDst <= sqrRadius && sqrDst > 1e-20f) {
+            if (sqrDst <= sqrRadius && sqrDst > 1e-6f) {
                 float invDst = rsqrtf(sqrDst);
                 float dst    = sqrDst * invDst;
                 float3 dir   = offset * invDst;
@@ -537,7 +542,7 @@ void ApplyPressureForces_Optimized(
                 float3 offset   = otherPos - samplePos;
                 float  sqrDst   = lengthSqr(offset);
 
-                if (sqrDst <= sqrRadius && sqrDst > 1e-20f) {
+                if (sqrDst <= sqrRadius && sqrDst > 1e-6f) {
                     float invDst = rsqrtf(sqrDst);
                     float dst    = sqrDst * invDst;
                     float3 dir   = offset * invDst;
@@ -578,7 +583,7 @@ __global__ void UpdatePositions(
     int numParticles, float particleSize, float boundsX, float boundsY, float boundsZ,
     float collisionDamping, float gravity, float dt,
     Collider* colliders, int numColliders, float smoothingRadius, float colliderDragModifier) {
-int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numParticles) return;
 
     float3 posLocal = make_float3(posX[i], posY[i], posZ[i]);
@@ -636,7 +641,7 @@ int i = blockIdx.x * blockDim.x + threadIdx.x;
                     float3 impulse = velocityChange * particleMass;
                     atomicAddFloat3(&colliders[k].forceAccumulator, impulse / dt);
 
-                    float stiffness = 13000.0f;
+                    float stiffness = 300.0f;
                     float3 reactionForce = normal * penetration * stiffness;
                     atomicAddFloat3(&colliders[k].forceAccumulator, -1.0f * reactionForce);
                 }
@@ -646,22 +651,43 @@ int i = blockIdx.x * blockDim.x + threadIdx.x;
 
     const float3 halfSize = make_float3(boundsX / 2, boundsY / 2, boundsZ / 2);
     const float3 edgeDst = make_float3(
-        halfSize.x - abs(posLocal.x),
-        halfSize.y - abs(posLocal.y),
-        halfSize.z - abs(posLocal.z)
+        halfSize.x - abs(posLocal.x) - particleSize,
+        halfSize.y - abs(posLocal.y) - particleSize,
+        halfSize.z - abs(posLocal.z) - particleSize
     );
 
+    const float wallStiffness = 300.0f;
+
+    if (edgeDst.x < smoothingRadius) {
+        float penetration = smoothingRadius - edgeDst.x;
+        velLocal.x += penetration * wallStiffness * -sign(posLocal.x) * dt;
+    }
+    if (edgeDst.y < smoothingRadius) {
+        float penetration = smoothingRadius - edgeDst.y;
+        velLocal.y += penetration * wallStiffness * -sign(posLocal.y) * dt;
+    }
+    if (edgeDst.z < smoothingRadius) {
+        float penetration = smoothingRadius - edgeDst.z;
+        velLocal.z += penetration * wallStiffness * -sign(posLocal.z) * dt;
+    }
+
     if (edgeDst.x <= 0) {
-        posLocal.x = halfSize.x * sign(posLocal.x);
-        velLocal.x *= -1 * collisionDamping;
+        posLocal.x = (halfSize.x - particleSize) * sign(posLocal.x);
+        if (posLocal.x * velLocal.x > 0.0f) velLocal.x *= -1.0f * collisionDamping;
     }
     if (edgeDst.y <= 0) {
-        posLocal.y = halfSize.y * sign(posLocal.y);
-        velLocal.y *= -1 * collisionDamping;
+        posLocal.y = (halfSize.y - particleSize) * sign(posLocal.y);
+        if (posLocal.y * velLocal.y > 0.0f) velLocal.y *= -1.0f * collisionDamping;
     }
     if (edgeDst.z <= 0) {
-        posLocal.z = halfSize.z * sign(posLocal.z);
-        velLocal.z *= -1 * collisionDamping;
+        posLocal.z = (halfSize.z - particleSize) * sign(posLocal.z);
+        if (posLocal.z * velLocal.z > 0.0f) velLocal.z *= -1.0f * collisionDamping;
+    }
+
+    const float MAX_SPEED = 105.0f;
+    float speed = length(velLocal);
+    if (speed > MAX_SPEED) {
+        velLocal = (velLocal / speed) * MAX_SPEED;
     }
 
     posX[i] = posLocal.x;
@@ -1076,6 +1102,19 @@ SPHSolver::~SPHSolver() {
     if (d_velX) cudaFree(d_velX);
     if (d_velY) cudaFree(d_velY);
     if (d_velZ) cudaFree(d_velZ);
+    if (d_sortedPredX) cudaFree(d_sortedPredX);
+    if (d_sortedPredY) cudaFree(d_sortedPredY);
+    if (d_sortedPredZ) cudaFree(d_sortedPredZ);
+    if (d_sortedVelX) cudaFree(d_sortedVelX);
+    if (d_sortedVelY) cudaFree(d_sortedVelY);
+    if (d_sortedVelZ) cudaFree(d_sortedVelZ);
+    if (d_densities) cudaFree(d_densities);
+    if (d_nearDensities) cudaFree(d_nearDensities);
+    if (d_spatialIndices) cudaFree(d_spatialIndices);
+    if (d_spatialKeys) cudaFree(d_spatialKeys);
+    if (d_startIndices) cudaFree(d_startIndices);
+    if (d_aos_temp) cudaFree(d_aos_temp);
+    if (d_colliders) cudaFree(d_colliders);
 }
 
 void SPHSolver::init(const std::vector<float> &positions, const std::vector<float> &velocities) {
@@ -1117,9 +1156,9 @@ void SPHSolver::init(const std::vector<float> &positions, const std::vector<floa
 
     m_params.densityScale = 15.0f / (2.0f * pi * h5);
     m_params.pressureScale = 15.0f / (pi * h5);
-    m_params.viscosityScale = 315.0f / (64.0f * pi * h9);
     m_params.nearDensityScale = 15.0f / (pi * h6);
     m_params.nearPressureScale = 45.0f / (pi * h6);
+    m_params.viscosityScale = 315.0f / (64.0f * pi * h9);
 }
 
 void SPHSolver::update(float dt) {
@@ -1175,9 +1214,12 @@ void SPHSolver::update(float dt) {
         m_params.particleSize, m_params.boundsX, m_params.boundsY, m_params.boundsZ,
         m_params.collisionDamping, m_params.gravity, dt, d_colliders, m_numColliders, m_params.smoothingRadius, m_params.colliderDragMultiplier);
 
-    IntegrateColliders<<<1, 32>>>(d_colliders, m_numColliders, m_params.boundsX, m_params.boundsY, m_params.boundsZ, m_params.gravity, dt);
+    if (m_numColliders > 0)
+    {
+        IntegrateColliders<<<1, 32>>>(d_colliders, m_numColliders, m_params.boundsX, m_params.boundsY, m_params.boundsZ, m_params.gravity, dt);
+        ResolveColliderCollisions<<<1, m_numColliders>>>(d_colliders, m_numColliders);
+    }
 
-    ResolveColliderCollisions<<<1, m_numColliders>>>(d_colliders, m_numColliders);
     cudaDeviceSynchronize();
 }
 
