@@ -30,7 +30,7 @@
 
 struct ParticleInstance {
     float x, y, z, pad0;
-    float r, g, b, a;
+    float vx, vy, vz, pad1;
 };
 
 void processGLTFNode(const tinygltf::Model& model, int nodeIndex, const float* parentMatrix,
@@ -494,6 +494,7 @@ private:
 
     // SPH particle data
     float* m_particlePositions = nullptr;
+    float* m_particleVelocities = nullptr;
     std::vector<uint32_t> m_particleColors;
     float m_particleRadius = 0.1f;
 
@@ -514,7 +515,7 @@ void AnitoWave::buildSceneList()
         empty.terrainSDFResolution = 64;
 
         empty.boundsX = 30.0f; empty.boundsY = 30.0; empty.boundsZ = 30.0f;
-        empty.particlesPerSide = 90;
+        empty.particlesPerSide = 100;
 
         empty.spawnOffsetX = 0.0f;
         empty.spawnOffsetY = 5.0f;
@@ -650,6 +651,7 @@ void AnitoWave::unloadCurrentScene()
     if (bgfx::isValid(m_terrainIB)) { bgfx::destroy(m_terrainIB); m_terrainIB = BGFX_INVALID_HANDLE; }
 
     if (m_particlePositions) { cudaFreeHost(m_particlePositions); m_particlePositions = nullptr; }
+    if (m_particleVelocities) { cudaFreeHost(m_particleVelocities); m_particleVelocities = nullptr; }
 }
 
 void AnitoWave::loadScene(int index)
@@ -734,8 +736,15 @@ void AnitoWave::loadScene(int index)
         fprintf(stderr, "loadScene: cudaMallocHost failed\n");
         return;
     }
-
     memcpy(m_particlePositions, tempPositions.data(), posByteSize);
+
+    if (cudaMallocHost((void**)&m_particleVelocities, posByteSize) != cudaSuccess)
+    {
+        fprintf(stderr, "loadScene: cudaMallocHost failed for velocities\n");
+        return;
+    }
+    memset(m_particleVelocities, 0, posByteSize);
+
     m_particleColors = tempColors;
 
     m_solver = new SPHSolver(totalParticles);
@@ -785,6 +794,12 @@ AnitoWave::~AnitoWave() {
         m_particlePositions = nullptr;
     }
 
+    if (m_particleVelocities)
+    {
+        cudaFreeHost(m_particleVelocities);
+        m_particleVelocities = nullptr;
+    }
+
     if (m_window) {
         bgfx::shutdown();
         glfwTerminate();
@@ -799,8 +814,8 @@ void AnitoWave::initStaticRenderResources() {
         .end();
 
     m_instanceLayout.begin()
-        .add(bgfx::Attrib::TexCoord7, 4, bgfx::AttribType::Float)
-        .add(bgfx::Attrib::TexCoord6, 4, bgfx::AttribType::Float, true)
+        .add(bgfx::Attrib::TexCoord7, 4, bgfx::AttribType::Float, true)
+        .add(bgfx::Attrib::TexCoord6, 4, bgfx::AttribType::Float)
         .end();
 
     generateSphereTemplate(12, 32);
@@ -815,7 +830,7 @@ void AnitoWave::initStaticRenderResources() {
 
     initColliderRendering();
 
-    m_program = loadProgram("vs_particles", "fs_particles");
+    m_program = loadProgram("vs_fluid_particles", "fs_fluid_particles");
 
     m_particleRadiusUniform = bgfx::createUniform("u_particleRadius", bgfx::UniformType::Vec4);
 }
@@ -824,40 +839,55 @@ void AnitoWave::initColliderRendering() {
     generateCubeTemplate();
 }
 
+// void AnitoWave::generateSphereTemplate(int stacks, int slices) {
+//     m_circleTemplate.clear();
+//     m_circleIndices.clear();
+//
+//     for (int i = 0; i <= stacks; ++i) {
+//         float v = (float)i / (float)stacks;
+//         float phi = v * bx::kPi;
+//
+//         for (int j = 0; j <= slices; ++j) {
+//             float u = (float)j / (float)slices;
+//             float theta = u * bx::kPi * 2.0f;
+//
+//             float x = bx::sin(phi) * bx::cos(theta);
+//             float y = bx::cos(phi);
+//             float z = bx::sin(phi) * bx::sin(theta);
+//
+//             m_circleTemplate.push_back({x, y, z, x, y, z, 0xffffffff});
+//         }
+//     }
+//
+//     for (int i = 0; i < stacks; ++i) {
+//         for (int j = 0; j < slices; ++j) {
+//             int p1 = i * (slices + 1) + j;
+//             int p2 = p1 + (slices + 1);
+//
+//             m_circleIndices.push_back(p1);
+//             m_circleIndices.push_back(p2);
+//             m_circleIndices.push_back(p1 + 1);
+//
+//             m_circleIndices.push_back(p1 + 1);
+//             m_circleIndices.push_back(p2);
+//             m_circleIndices.push_back(p2 + 1);
+//         }
+//     }
+// }
+
 void AnitoWave::generateSphereTemplate(int stacks, int slices) {
     m_circleTemplate.clear();
     m_circleIndices.clear();
 
-    for (int i = 0; i <= stacks; ++i) {
-        float v = (float)i / (float)stacks;
-        float phi = v * bx::kPi;
+    // A flat 2D square facing the camera
+    m_circleTemplate = {
+        {-1.0f, -1.0f, 0.0f,  0,0,0, 0xffffffff}, // Bottom-left
+        { 1.0f, -1.0f, 0.0f,  0,0,0, 0xffffffff}, // Bottom-right
+        {-1.0f,  1.0f, 0.0f,  0,0,0, 0xffffffff}, // Top-left
+        { 1.0f,  1.0f, 0.0f,  0,0,0, 0xffffffff}  // Top-right
+    };
 
-        for (int j = 0; j <= slices; ++j) {
-            float u = (float)j / (float)slices;
-            float theta = u * bx::kPi * 2.0f;
-
-            float x = bx::sin(phi) * bx::cos(theta);
-            float y = bx::cos(phi);
-            float z = bx::sin(phi) * bx::sin(theta);
-
-            m_circleTemplate.push_back({x, y, z, x, y, z, 0xffffffff});
-        }
-    }
-
-    for (int i = 0; i < stacks; ++i) {
-        for (int j = 0; j < slices; ++j) {
-            int p1 = i * (slices + 1) + j;
-            int p2 = p1 + (slices + 1);
-
-            m_circleIndices.push_back(p1);
-            m_circleIndices.push_back(p2);
-            m_circleIndices.push_back(p1 + 1);
-
-            m_circleIndices.push_back(p1 + 1);
-            m_circleIndices.push_back(p2);
-            m_circleIndices.push_back(p2 + 1);
-        }
-    }
+    m_circleIndices = {0, 1, 2, 1, 3, 2};
 }
 
 void AnitoWave::generateCubeTemplate() {
@@ -945,18 +975,15 @@ void AnitoWave::renderParticles() {
     instances.reserve(numParticles);
 
     for (size_t i = 0; i < numParticles; ++i) {
-        uint32_t c = m_particleColors[i];
-        float a = ((c >> 24) & 0xff) / 255.f;
-        float b = ((c >> 16) & 0xff) / 255.f;
-        float g = ((c >> 8) & 0xff) / 255.f;
-        float r = ((c) & 0xff) / 255.f;
-
         instances.push_back({
             m_particlePositions[i * 3],
             m_particlePositions[i * 3 + 1],
             m_particlePositions[i * 3 + 2],
             0.0f,
-            r, g, b, a
+            m_particleVelocities[i * 3 + 0],
+            m_particleVelocities[i * 3 + 1],
+            m_particleVelocities[i * 3 + 2],
+            0.0f
         });
     }
 
@@ -1006,7 +1033,7 @@ void AnitoWave::renderColliders() {
         bgfx::allocInstanceDataBuffer(&idb, 1, m_instanceLayout.getStride());
         ParticleInstance* data = (ParticleInstance*)idb.data;
         data[0].x = 0.0f; data[0].y = 0.0f; data[0].z = 0.0f; data[0].pad0 = 0.0f;
-        data[0].r = 1.0f; data[0].g = 1.0f; data[0].b = 1.0f; data[0].a = 1.0f;
+        data[0].vx = 1.0f; data[0].vy = 1.0f; data[0].vz = 1.0f; data[0].pad1 = 1.0f;
     }
 
     for (const auto& col : colliders) {
@@ -1192,7 +1219,7 @@ void AnitoWave::run() {
     double accumulator = 0.0f;
 
     const float FIXED_DT = 1.0f / 360.0f;
-    const int MAX_STEPS_PER_FRAME = 13;
+    const int MAX_STEPS_PER_FRAME = 3;
 
     while (!glfwWindowShouldClose(m_window)) {
         glfwPollEvents();
@@ -1232,6 +1259,7 @@ void AnitoWave::run() {
         }
 
         m_solver->getPositions(m_particlePositions);
+        m_solver->getVelocities(m_particleVelocities);
 
         cudaStreamSynchronize(0);
 
