@@ -641,7 +641,7 @@ __global__ void UpdatePositions(
                     float3 impulse = velocityChange * particleMass;
                     atomicAddFloat3(&colliders[k].forceAccumulator, impulse / dt);
 
-                    float stiffness = 300.0f;
+                    float stiffness = 800.0f;
                     float3 reactionForce = normal * penetration * stiffness;
                     atomicAddFloat3(&colliders[k].forceAccumulator, -1.0f * reactionForce);
                 }
