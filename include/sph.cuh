@@ -87,6 +87,7 @@ public:
     void getColliders(std::vector<Collider>& outColliders);
 
     void getPositions(float* outPositions);
+    void getVelocities(float* outVelocities);
 
     int getNumParticles() const { return m_numParticles; }
 

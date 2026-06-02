@@ -1186,7 +1186,8 @@ void SPHSolver::init(const std::vector<float> &positions, const std::vector<floa
     m_params.pressureScale = 15.0f / (pi * h5);
     m_params.nearDensityScale = 15.0f / (pi * h6);
     m_params.nearPressureScale = 45.0f / (pi * h6);
-    m_params.viscosityScale = 315.0f / (64.0f * pi * h9);
+    // m_params.viscosityScale = 315.0f / (64.0f * pi * h9);
+    m_params.viscosityScale = 15.0f / (pi * h6);
 }
 
 void SPHSolver::update(float dt) {
@@ -1283,6 +1284,16 @@ void SPHSolver::getPositions(float* outPositions) {
     soa_to_aos<<<numBlock, blockSize>>>(d_aos_temp, d_posX, d_posY, d_posZ, m_numParticles);
 
     cudaMemcpyAsync(outPositions, d_aos_temp, m_numParticles * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+}
+
+void SPHSolver::getVelocities(float* outVelocities)
+{
+    int blockSize = 256;
+    int numBlock = (m_numParticles + blockSize - 1) / blockSize;
+
+    soa_to_aos<<<numBlock, blockSize>>>(d_aos_temp, d_velX, d_velY, d_velZ, m_numParticles);
+
+    cudaMemcpyAsync(outVelocities, d_aos_temp, m_numParticles * 3 * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
 void SPHSolver::setParams(const SPHParams &params) {
