@@ -394,8 +394,8 @@ __device__ float SmoothingKernelDerivative(float dst, float radius, float scale)
 
 __device__ float ViscositySmoothingKernel(float dst, float radius, float scale) {
     if (dst >= radius) return 0.0f;
-    // float v = radius * radius - dst * dst;
-    float v = radius - dst;
+    float v = radius * radius - dst * dst;
+    // float v = radius - dst;
     return v * v * v * scale;
 }
 
@@ -1186,8 +1186,8 @@ void SPHSolver::init(const std::vector<float> &positions, const std::vector<floa
     m_params.pressureScale = 15.0f / (pi * h5);
     m_params.nearDensityScale = 15.0f / (pi * h6);
     m_params.nearPressureScale = 45.0f / (pi * h6);
-    // m_params.viscosityScale = 315.0f / (64.0f * pi * h9);
-    m_params.viscosityScale = 15.0f / (pi * h6);
+    m_params.viscosityScale = 315.0f / (64.0f * pi * h9);
+    // m_params.viscosityScale = 15.0f / (pi * h6);
 }
 
 void SPHSolver::update(float dt) {
