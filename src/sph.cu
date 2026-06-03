@@ -684,7 +684,7 @@ __global__ void UpdatePositions(
         if (posLocal.z * velLocal.z > 0.0f) velLocal.z *= -1.0f * collisionDamping;
     }
 
-    const float MAX_SPEED = 105.0f;
+    const float MAX_SPEED = 60.0f;
     float speed = length(velLocal);
     if (speed > MAX_SPEED) {
         velLocal = (velLocal / speed) * MAX_SPEED;
