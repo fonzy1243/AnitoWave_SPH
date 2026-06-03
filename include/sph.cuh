@@ -53,7 +53,7 @@ struct Collider {
 struct SPHParams {
     float particleSize = 0.09f;
     float gravity = 0.0f;
-    float collisionDamping = 0.15f;
+    float collisionDamping = 0.95f;
     float predictFactor = 1/120.0f;
     float boundsX = 10.0f;
     float boundsY = 10.0f;
@@ -61,8 +61,8 @@ struct SPHParams {
     float smoothingRadius = 0.25;
     float targetDensity = 255.5f;
     float pressureMultiplier = 250.0f;
-    float viscosityStrength = 0.1f;
-    float nearPressureMultiplier = 15.0f;
+    float viscosityStrength = 10.0f;
+    float nearPressureMultiplier = 0.5f;
     float colliderDragMultiplier = 0.001f;
 
     float densityScale;        // For SmoothingKernel
