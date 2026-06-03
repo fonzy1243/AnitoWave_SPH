@@ -509,22 +509,22 @@ void AnitoWave::buildSceneList()
 {
     {
         SceneDef empty{};
-        empty.name = "Empty";
+        empty.name = "Dam Break";
         empty.terrainMeshPath = "";
         empty.terrainScale = 1.0f;
         empty.terrainSDFResolution = 64;
 
-        empty.boundsX = 30.0f; empty.boundsY = 30.0; empty.boundsZ = 30.0f;
+        empty.boundsX = 40.0f; empty.boundsY = 25.0; empty.boundsZ = 12.0f;
         empty.particlesPerSide = 100;
 
-        empty.spawnOffsetX = 0.0f;
-        empty.spawnOffsetY = 5.0f;
+        empty.spawnOffsetX = -14.0f;
+        empty.spawnOffsetY = -8.0f;
         empty.spawnOffsetZ = 0.0f;
 
-        empty.gravity = 0;
+        empty.gravity = 10;
         empty.targetDensity = 650.0f;
-        empty.pressureMultiplier = 150.0f;
-        empty.viscosityStrength = 1.0f;
+        empty.pressureMultiplier = 850.0f;
+        empty.viscosityStrength = 0.01f;
 
         m_scenes.push_back(empty);
     }
@@ -698,14 +698,14 @@ void AnitoWave::loadScene(int index)
 
     const int N = scene.particlesPerSide;
 
-    const float spawnFraction = 0.6f;
+    const float spawnFraction = 0.95f;
     const float spawnRangeX   = scene.boundsX * spawnFraction;
     const float spawnRangeY   = scene.boundsY * spawnFraction;
     const float spawnRangeZ   = scene.boundsZ * spawnFraction;
 
     const float spacing = bx::min(spawnRangeX / N,
                       bx::min(spawnRangeY / N,
-                              spawnRangeZ / N)) * 0.95f;
+                              spawnRangeZ / N)) * 1.05f;
 
     const float startX = scene.spawnOffsetX - ((N - 1) * spacing) * 0.5f;
     const float startY = scene.spawnOffsetY - ((N - 1) * spacing) * 0.5f;
@@ -1218,8 +1218,8 @@ void AnitoWave::run() {
     double lastTime = glfwGetTime();
     double accumulator = 0.0f;
 
-    const float FIXED_DT = 1.0f / 360.0f;
-    const int MAX_STEPS_PER_FRAME = 3;
+    const float FIXED_DT = 1.0f / 180.0f;
+    const int MAX_STEPS_PER_FRAME = 35;
 
     while (!glfwWindowShouldClose(m_window)) {
         glfwPollEvents();
@@ -1239,10 +1239,9 @@ void AnitoWave::run() {
         double frameTime = currentTime - lastTime;
         lastTime = currentTime;
 
-        if (frameTime > 0.25) frameTime = 0.25;
+        if (frameTime > 0.1) frameTime = 0.1;
 
         accumulator += frameTime;
-
         int steps = 0;
 
         // Simulation and rendering
@@ -1254,9 +1253,9 @@ void AnitoWave::run() {
             steps++;
         }
 
-        if (accumulator > FIXED_DT) {
-            accumulator = 0.0f;
-        }
+        // if (accumulator > FIXED_DT) {
+        //     accumulator = 0.0f;
+        // }
 
         m_solver->getPositions(m_particlePositions);
         m_solver->getVelocities(m_particleVelocities);

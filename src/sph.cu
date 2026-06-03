@@ -364,7 +364,7 @@ __device__ uint32_t GetKeyFromHash(uint32_t hash, uint32_t hashTableSize) {
 __device__ float2 ConvertDensityToPressure(float density, float nearDensity, float targetDensity, float pressureMultiplier, float nearPressureMultiplier) {
     float densityError = density  - targetDensity;
     float pressure = densityError  * pressureMultiplier;
-    pressure = max(pressure, 0.0f);
+    pressure = max(pressure, -150.0f);
     float nearPressure = nearDensity * nearPressureMultiplier;
 
     return make_float2(pressure, nearPressure);
@@ -475,6 +475,7 @@ void ApplyPressureForces_Optimized(
 
     float3 pressureForce  = make_float3(0.f, 0.f, 0.f);
     float3 viscosityForce = make_float3(0.f, 0.f, 0.f);
+    int neighborCount = 0;
     const float sqrRadius = smoothingRadius * smoothingRadius;
 
 
@@ -543,6 +544,7 @@ void ApplyPressureForces_Optimized(
                 float  sqrDst   = lengthSqr(offset);
 
                 if (sqrDst <= sqrRadius && sqrDst > 1e-6f) {
+                    neighborCount++;
                     float invDst = rsqrtf(sqrDst);
                     float dst    = sqrDst * invDst;
                     float3 dir   = offset * invDst;
@@ -571,10 +573,16 @@ void ApplyPressureForces_Optimized(
 
     float3 totalForce   = pressureForce + (viscosityForce * viscosityStrength);
     float3 acceleration = totalForce / max(myDensity, 0.0001f);
+    float3 finalVel = myVel + (acceleration * dt);
 
-    velX[i]   += acceleration.x * dt;
-    velY[i] += acceleration.y * dt;
-    velZ[i] += acceleration.z * dt;
+    if (neighborCount < 8)
+    {
+        finalVel -= finalVel * (dt * 0.75f);
+    }
+
+    velX[i] = finalVel.x;
+    velY[i] = finalVel.y;
+    velZ[i] = finalVel.z;
 }
 
 __global__ void UpdatePositions(
@@ -655,21 +663,6 @@ __global__ void UpdatePositions(
         halfSize.y - abs(posLocal.y) - particleSize,
         halfSize.z - abs(posLocal.z) - particleSize
     );
-
-    const float wallStiffness = 300.0f;
-
-    if (edgeDst.x < smoothingRadius) {
-        float penetration = smoothingRadius - edgeDst.x;
-        velLocal.x += penetration * wallStiffness * -sign(posLocal.x) * dt;
-    }
-    if (edgeDst.y < smoothingRadius) {
-        float penetration = smoothingRadius - edgeDst.y;
-        velLocal.y += penetration * wallStiffness * -sign(posLocal.y) * dt;
-    }
-    if (edgeDst.z < smoothingRadius) {
-        float penetration = smoothingRadius - edgeDst.z;
-        velLocal.z += penetration * wallStiffness * -sign(posLocal.z) * dt;
-    }
 
     if (edgeDst.x <= 0) {
         posLocal.x = (halfSize.x - particleSize) * sign(posLocal.x);
