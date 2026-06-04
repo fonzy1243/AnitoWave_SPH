@@ -437,10 +437,13 @@ private:
 
     void initStaticRenderResources();
     void initColliderRendering();
-    void renderParticles();
+    void renderParticles(bgfx::ViewId viewId, bgfx::ProgramHandle program, uint64_t renderState);
+    void renderFluidPasses();
     void renderColliders();
     void renderImGui();
     void generateSphereTemplate(int stacks, int slices);
+    void drawFullscreenQuad(bgfx::ViewId viewId, bgfx::ProgramHandle program, uint64_t renderState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A);
+    void renderFluidComposite();
     void generateCubeTemplate();
     void updateCamera();
 
@@ -456,6 +459,7 @@ private:
     int32_t m_scroll = 0;
     bool m_showStats = false;
     bool m_showParamEditor = true;
+    bool m_showRenderEditor = true;
     const bgfx::ViewId m_kClearView = 0;
     int m_activeScene = 0;
 
@@ -492,6 +496,47 @@ private:
     bgfx::VertexBufferHandle m_terrainVB = BGFX_INVALID_HANDLE;
     bgfx::IndexBufferHandle m_terrainIB = BGFX_INVALID_HANDLE;
 
+    // Depth handles
+    bgfx::TextureHandle m_depthTexture = BGFX_INVALID_HANDLE;
+    bgfx::TextureHandle m_hwDepthTexture = BGFX_INVALID_HANDLE;
+    bgfx::FrameBufferHandle m_depthFbo = BGFX_INVALID_HANDLE;
+    bgfx::ProgramHandle m_depthProgram = BGFX_INVALID_HANDLE;
+    const bgfx::ViewId m_kDepthPassView = 1;
+
+    // Depth program test
+    bgfx::UniformHandle m_depthSampler;
+    bgfx::ProgramHandle m_debugDepthProgram = BGFX_INVALID_HANDLE;
+
+    // Gaussian blur
+    float m_fluidBlurSmoothness = 1.0f;
+    float m_fluidBlurSize = 10.0f;
+    float m_fluidDepthFactor = 1.0f;
+    const bgfx::ViewId m_kBlurXPassView = 2;
+    const bgfx::ViewId m_kBlurYPassView = 3;
+    const bgfx::ViewId m_kCompositePassView = 5;
+
+    bgfx::ProgramHandle m_blurProgram = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle m_blurParamsUniform = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle m_blurFalloffUniform = BGFX_INVALID_HANDLE;
+
+    // Framebuffers for blur ping-pong
+    bgfx::TextureHandle m_blurXTexture = BGFX_INVALID_HANDLE;
+    bgfx::FrameBufferHandle m_blurXFbo = BGFX_INVALID_HANDLE;
+
+    bgfx::TextureHandle m_blurYTexture = BGFX_INVALID_HANDLE;
+    bgfx::FrameBufferHandle m_blurYFbo = BGFX_INVALID_HANDLE;
+
+    // Normals shader
+    bgfx::UniformHandle m_texelSizeUniform = BGFX_INVALID_HANDLE;
+    bgfx::ProgramHandle m_compositeProgram = BGFX_INVALID_HANDLE;
+
+    // Thickness
+    bgfx::ViewId m_kThicknessPassView = 4;
+    bgfx::ProgramHandle m_thicknessProgram = BGFX_INVALID_HANDLE;
+    bgfx::TextureHandle m_thicknessTexture = BGFX_INVALID_HANDLE;
+    bgfx::FrameBufferHandle m_thicknessFrameBuffer = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle m_thicknessSampler = BGFX_INVALID_HANDLE;
+
     // SPH particle data
     float* m_particlePositions = nullptr;
     float* m_particleVelocities = nullptr;
@@ -523,8 +568,8 @@ void AnitoWave::buildSceneList()
 
         empty.gravity = 10;
         empty.targetDensity = 650.0f;
-        empty.pressureMultiplier = 850.0f;
-        empty.viscosityStrength = 0.01f;
+        empty.pressureMultiplier = 550.0f;
+        empty.viscosityStrength = 10.00f;
 
         m_scenes.push_back(empty);
     }
@@ -832,6 +877,27 @@ void AnitoWave::initStaticRenderResources() {
 
     m_program = loadProgram("vs_fluid_particles", "fs_fluid_particles");
 
+    m_depthProgram = loadProgram("vs_fluid_depth", "fs_fluid_depth");
+    m_debugDepthProgram = loadProgram("vs_fullscreen", "fs_debug_depth");
+
+    m_blurProgram = loadProgram("vs_fullscreen", "fs_fluid_blur");
+    m_blurParamsUniform = bgfx::createUniform("u_blurParams", bgfx::UniformType::Vec4);
+    m_blurFalloffUniform = bgfx::createUniform("u_blurFalloff", bgfx::UniformType::Vec4);
+
+    m_compositeProgram = loadProgram("vs_fullscreen", "fs_fluid_composite");
+    m_texelSizeUniform = bgfx::createUniform("u_texelSize", bgfx::UniformType::Vec4);
+
+    m_thicknessProgram = loadProgram("vs_fluid_thickness", "fs_fluid_thickness");
+    m_thicknessTexture = bgfx::createTexture2D(
+        m_width, m_height, false, 1,
+        bgfx::TextureFormat::R16F,
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+    );
+    bgfx::TextureHandle thicknessAttachments[] = { m_thicknessTexture, m_hwDepthTexture };
+    m_thicknessFrameBuffer = bgfx::createFrameBuffer(BX_COUNTOF(thicknessAttachments), thicknessAttachments, false);
+    bgfx::setViewClear(m_kThicknessPassView, BGFX_CLEAR_COLOR, 0x000000FF, 1.0f, 0);
+    bgfx::setViewFrameBuffer(m_kThicknessPassView, m_thicknessFrameBuffer);
+
     m_particleRadiusUniform = bgfx::createUniform("u_particleRadius", bgfx::UniformType::Vec4);
 }
 
@@ -965,9 +1031,57 @@ void AnitoWave::updateCamera() {
     bx::mtxProj(proj, 60.0f, aspect, 0.1f, 100.0f, bgfx::getCaps()->homogeneousDepth);
 
     bgfx::setViewTransform(m_kClearView, view, proj);
+    bgfx::setViewTransform(m_kDepthPassView, view, proj);
+    bgfx::setViewTransform(m_kCompositePassView, view, proj);
+    bgfx::setViewTransform(m_kThicknessPassView, view, proj);
 }
 
-void AnitoWave::renderParticles() {
+void AnitoWave::drawFullscreenQuad(bgfx::ViewId viewId, bgfx::ProgramHandle program, uint64_t renderState)
+{
+    if (bgfx::getAvailTransientVertexBuffer(3, m_particleLayout) == 3)
+    {
+        bgfx::TransientVertexBuffer tvb;
+        bgfx::allocTransientVertexBuffer(&tvb, 3, m_particleLayout);
+        bgfx::setVertexBuffer(0, &tvb);
+        bgfx::setState(renderState);
+        bgfx::submit(viewId, program);
+    }
+}
+
+void AnitoWave::renderFluidComposite()
+{
+    int kernelSize = (int)m_fluidBlurSize * 2 + 1;
+    float sigma = (float)kernelSize / (6.0f * bx::max(0.001f, m_fluidBlurSmoothness));
+    // Horizontal Pass
+    // Read from Depth, Write to Blur X
+    float blurParamsX[4] = { 1.0f / m_width, 0.0f, m_fluidBlurSize, sigma };
+    float falloffParams[4] = { m_fluidDepthFactor, 0.0f, 0.0f, 0.0f };
+    bgfx::setUniform(m_blurParamsUniform, blurParamsX);
+    bgfx::setUniform(m_blurFalloffUniform, falloffParams);
+    bgfx::setTexture(0, m_depthSampler, m_depthTexture);
+    drawFullscreenQuad(m_kBlurXPassView, m_blurProgram);
+
+    // Vertical Pass
+    // Read from Blur X, Write to Blur Y
+    float blurParamsY[4] = { 0.0f, 1.0f / m_height, m_fluidBlurSize, sigma };
+    bgfx::setUniform(m_blurParamsUniform, blurParamsY);
+    bgfx::setUniform(m_blurFalloffUniform, falloffParams);
+    bgfx::setTexture(0, m_depthSampler, m_blurXTexture);
+    drawFullscreenQuad(m_kBlurYPassView, m_blurProgram);
+
+    // Normals uniform
+    float texelData[4] = { 1.0f / m_width, 1.0f / m_height, 0.0f, 0.0f };
+    bgfx::setUniform(m_texelSizeUniform, texelData);
+
+    // Composite
+    // Read from Blur Y, output to screen
+    bgfx::setTexture(0, m_depthSampler, m_blurYTexture);
+    bgfx::setTexture(1, m_thicknessSampler, m_thicknessTexture);
+    uint64_t compositeState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_BLEND_ALPHA;
+    drawFullscreenQuad(m_kCompositePassView, m_compositeProgram, compositeState);
+}
+
+void AnitoWave::renderParticles(bgfx::ViewId viewId, bgfx::ProgramHandle program, uint64_t renderState) {
     const size_t numParticles = m_solver->getNumParticles();
     if (numParticles == 0) return;
 
@@ -1007,14 +1121,64 @@ void AnitoWave::renderParticles() {
             float radiusData[4] = { m_particleRadius, 0.0f, 0.0f, 0.0f };
             bgfx::setUniform(m_particleRadiusUniform, radiusData);
 
-            bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_WRITE_Z
-                | BGFX_STATE_DEPTH_TEST_LESS | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_INV_SRC_ALPHA));
+            bgfx::setState(renderState);
 
-            bgfx::submit(m_kClearView, m_program);
+            bgfx::submit(viewId, program);
 
             offset += count;
         } else {
             fprintf(stderr, "Instance buffer allocation failed.\n");
+        }
+    }
+}
+
+void AnitoWave::renderFluidPasses() {
+    const size_t numParticles = m_solver->getNumParticles();
+    if (numParticles == 0) return;
+
+    std::vector<ParticleInstance> instances;
+    instances.reserve(numParticles);
+    for (size_t i = 0; i < numParticles; ++i) {
+        instances.push_back({
+            m_particlePositions[i * 3], m_particlePositions[i * 3 + 1], m_particlePositions[i * 3 + 2], 0.0f,
+            m_particleVelocities[i * 3 + 0], m_particleVelocities[i * 3 + 1], m_particleVelocities[i * 3 + 2], 0.0f
+        });
+    }
+
+    uint32_t maxAvailable = bgfx::getAvailInstanceDataBuffer(numParticles, m_instanceLayout.getStride());
+    const uint32_t maxInstancesPerBatch = bx::min(maxAvailable, 1048576u);
+    uint32_t offset = 0;
+
+    uint64_t depthState = BGFX_STATE_WRITE_R | BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS;
+    uint64_t thicknessState = BGFX_STATE_WRITE_R | BGFX_STATE_BLEND_ADD;
+
+    while (offset < numParticles) {
+        uint32_t count = bx::min(maxInstancesPerBatch, (uint32_t)numParticles - offset);
+        bgfx::InstanceDataBuffer idb{};
+        bgfx::allocInstanceDataBuffer(&idb, count, m_instanceLayout.getStride());
+
+        if (idb.data != NULL) {
+            memcpy(idb.data, &instances[offset], count * sizeof(ParticleInstance));
+
+            float radiusData[4] = { m_particleRadius, 0.0f, 0.0f, 0.0f };
+            bgfx::setUniform(m_particleRadiusUniform, radiusData);
+
+            bgfx::setVertexBuffer(0, m_circleVB);
+            bgfx::setIndexBuffer(m_circleIB);
+            bgfx::setInstanceDataBuffer(&idb);
+
+            // --- PASS 1: DEPTH ---
+            bgfx::setState(depthState);
+            bgfx::submit(m_kDepthPassView, m_depthProgram, 0, BGFX_DISCARD_NONE);
+
+            // --- PASS 2: THICKNESS ---
+            bgfx::setState(thicknessState);
+            bgfx::submit(m_kThicknessPassView, m_thicknessProgram);
+
+            offset += count;
+        } else {
+            fprintf(stderr, "Instance buffer allocation failed.\n");
+            break;
         }
     }
 }
@@ -1110,7 +1274,7 @@ void AnitoWave::renderImGui() {
             ImGui::Separator();
             ImGui::Text("Forces");
             ImGui::SliderFloat("Gravity", &params.gravity, 0.0f, 20.0f);
-            ImGui::SliderFloat("Viscosity", &params.viscosityStrength, 0.0f, 20.0f);
+            ImGui::SliderFloat("Viscosity", &params.viscosityStrength, 0.0f, 100.0f);
             ImGui::SliderFloat("Target Density", &params.targetDensity, 5.0f, 2000.0f);
             ImGui::SliderFloat("Pressure Multiplier", &params.pressureMultiplier, 10.0f, 2000.0f);
             ImGui::SliderFloat("Near Pressure Multiplier", &params.nearPressureMultiplier, 0.0f, 100.0f);
@@ -1155,6 +1319,20 @@ void AnitoWave::renderImGui() {
         ImGui::End();
     }
 
+    if (m_showRenderEditor)
+    {
+        ImGui::SetNextWindowPos(ImVec2(320, 10), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(300, 150), ImGuiCond_FirstUseEver);
+
+        if (ImGui::Begin("Rendering Parameters", &m_showRenderEditor)) {
+            ImGui::Text("Screen Space Fluid");
+            ImGui::SliderFloat("Blur Radius", &m_fluidBlurSize, 1.0f, 100.0f, "%.0f");
+            ImGui::SliderFloat("Blur Smoothness", &m_fluidBlurSmoothness, 0.1f, 3.0f);
+            ImGui::SliderFloat("Depth Factor (Edge Sharpness)", &m_fluidDepthFactor, 0.0f, 10.0f);
+        }
+        ImGui::End();
+    }
+
     imguiEndFrame();
 }
 
@@ -1190,8 +1368,8 @@ bool AnitoWave::init() {
     init.resolution.width = m_config.width;
     init.resolution.height = m_config.height;
     init.resolution.reset = m_config.vsync ? BGFX_RESET_VSYNC : BGFX_RESET_NONE;
-    init.limits.maxTransientVbSize = 32 * 1024 * 1024;
-    init.limits.maxTransientIbSize = 32 * 1024 * 1024;
+    init.limits.maxTransientVbSize = 128 * 1024 * 1024;
+    init.limits.maxTransientIbSize = 128 * 1024 * 1024;
     if (!bgfx::init(init)) {
         fprintf(stderr, "Failed to initialize bgfx\n");
         glfwDestroyWindow(m_window);
@@ -1201,6 +1379,51 @@ bool AnitoWave::init() {
     // Set view 0 to window dimension
     bgfx::setViewClear(m_kClearView, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x303030ff, 1.0f, 0);
     bgfx::setViewRect(m_kClearView, 0, 0, bgfx::BackbufferRatio::Equal);
+    bgfx::setViewRect(m_kThicknessPassView, 0, 0, m_width, m_height);
+
+    bgfx::TextureHandle fbTextures[2];
+
+    fbTextures[0] = bgfx::createTexture2D(
+        m_width, m_height, false, 1,
+        bgfx::TextureFormat::R32F,
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+    );
+
+    fbTextures[1] = bgfx::createTexture2D(
+        m_width, m_height, false, 1,
+        bgfx::TextureFormat::D24F,
+        BGFX_TEXTURE_RT
+    );
+    m_depthTexture = fbTextures[0];
+    m_hwDepthTexture = fbTextures[1];
+    // Bind both to the FBO
+    m_depthFbo = bgfx::createFrameBuffer(2, fbTextures, true);
+
+    // Configure the View
+    bgfx::setViewClear(m_kDepthPassView, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x00000000, 1.0f, 0);
+    bgfx::setViewFrameBuffer(m_kDepthPassView, m_depthFbo);
+    bgfx::setViewRect(m_kDepthPassView, 0, 0, m_width, m_height);
+
+    // For debugging depth
+    m_depthSampler = bgfx::createUniform("s_depth", bgfx::UniformType::Sampler);
+    m_thicknessSampler = bgfx::createUniform("s_thickness", bgfx::UniformType::Sampler);
+    bgfx::setViewRect(m_kCompositePassView, 0, 0, bgfx::BackbufferRatio::Equal);
+
+    // --- Blur X Framebuffer ---
+    m_blurXTexture = bgfx::createTexture2D(m_width, m_height, false, 1, bgfx::TextureFormat::R32F, BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+    m_blurXFbo = bgfx::createFrameBuffer(1, &m_blurXTexture, true);
+
+    // --- Blur Y Framebuffer ---
+    m_blurYTexture = bgfx::createTexture2D(m_width, m_height, false, 1, bgfx::TextureFormat::R32F, BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+    m_blurYFbo = bgfx::createFrameBuffer(1, &m_blurYTexture, true);
+
+    bgfx::setViewClear(m_kBlurXPassView, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x00000000, 1.0f, 0);
+    bgfx::setViewFrameBuffer(m_kBlurXPassView, m_blurXFbo);
+    bgfx::setViewRect(m_kBlurXPassView, 0, 0, m_width, m_height);
+
+    bgfx::setViewClear(m_kBlurYPassView, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x00000000, 1.0f, 0);
+    bgfx::setViewFrameBuffer(m_kBlurYPassView, m_blurYFbo);
+    bgfx::setViewRect(m_kBlurYPassView, 0, 0, m_width, m_height);
 
     imguiCreate();
 
@@ -1219,7 +1442,7 @@ void AnitoWave::run() {
     double accumulator = 0.0f;
 
     const float FIXED_DT = 1.0f / 180.0f;
-    const int MAX_STEPS_PER_FRAME = 35;
+    const int MAX_STEPS_PER_FRAME = 15;
 
     while (!glfwWindowShouldClose(m_window)) {
         glfwPollEvents();
@@ -1262,8 +1485,16 @@ void AnitoWave::run() {
 
         cudaStreamSynchronize(0);
 
-        renderParticles();
+        // uint64_t depthState = BGFX_STATE_WRITE_R | BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS;
+        // renderParticles(m_kDepthPassView, m_depthProgram, depthState);
+        //
+        // uint64_t thicknessState = BGFX_STATE_WRITE_R | BGFX_STATE_BLEND_ADD;
+        // renderParticles(m_kThicknessPassView, m_thicknessProgram, thicknessState);
+        renderFluidPasses();
+
         renderColliders();
+        renderFluidComposite();
+
         renderImGui();
 
         bgfx::setDebug(m_showStats ? BGFX_DEBUG_STATS : BGFX_DEBUG_TEXT);
@@ -1283,6 +1514,10 @@ void AnitoWave::glfwKeyCallback(GLFWwindow *window, int key, int scancode, int a
 
     if (app && key == GLFW_KEY_F2 && action == GLFW_RELEASE) {
         app->m_showParamEditor = !app->m_showParamEditor;
+    }
+
+    if (app && key == GLFW_KEY_F3 && action == GLFW_RELEASE) {
+        app->m_showRenderEditor = !app->m_showRenderEditor;
     }
 }
 
