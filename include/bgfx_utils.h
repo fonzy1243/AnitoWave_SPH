@@ -6,6 +6,8 @@
 #include <bx/filepath.h>
 #include <bgfx/bgfx.h>
 
+const bgfx::Memory* loadMemoryFromFile(const bx::StringView& _filePath);
+
 bgfx::ShaderHandle loadShader(const bx::StringView& _name);
 
 bgfx::ProgramHandle loadProgram(const bx::StringView& _vsName, const bx::StringView& _fsName);

@@ -210,3 +210,17 @@ add_custom_target(CopyMeshes
 )
 
 add_dependencies(AnitoWave_SPH CopyMeshes)
+
+# -----------------
+# Textures folder
+# -----------------
+file(MAKE_DIRECTORY ${CMAKE_SOURCE_DIR}/textures)
+
+add_custom_target(CopyTextures
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/textures"
+        "$<TARGET_FILE_DIR:AnitoWave_SPH>/textures"
+        COMMENT "Copying textures to output directory..."
+)
+
+add_dependencies(AnitoWave_SPH CopyTextures)

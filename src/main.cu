@@ -28,6 +28,8 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <tiny_gltf.h>
 
+const uint32_t WHITE_PARTICLE_MAX = 131072;
+
 struct ParticleInstance {
     float x, y, z, pad0;
     float vx, vy, vz, pad1;
@@ -38,7 +40,8 @@ void processGLTFNode(const tinygltf::Model& model, int nodeIndex, const float* p
                      std::vector<std::array<int, 3>>& outTriangles,
                      std::vector<PosColorVertex>& outRenderVertices,
                      std::vector<uint32_t>& outRenderIndices,
-                     float scale)
+                     float scale,
+                     std::vector<MeshDrawGroup>& outDrawGroups)
 {
     const tinygltf::Node& node = model.nodes[nodeIndex];
     float localMatrix[16];
@@ -79,18 +82,42 @@ void processGLTFNode(const tinygltf::Model& model, int nodeIndex, const float* p
     if (node.mesh >= 0) {
         const tinygltf::Mesh& mesh = model.meshes[node.mesh];
         for (const auto& primitive : mesh.primitives) {
+            uint32_t indexStart = (uint32_t)outRenderIndices.size();
 
+            // POSITION
             const tinygltf::Accessor& posAccessor = model.accessors[primitive.attributes.at("POSITION")];
             const tinygltf::BufferView& posView = model.bufferViews[posAccessor.bufferView];
             const tinygltf::Buffer& posBuffer = model.buffers[posView.buffer];
             const float* positions = reinterpret_cast<const float*>(&posBuffer.data[posView.byteOffset + posAccessor.byteOffset]);
 
+            // NORMAL
             const float* normals = nullptr;
             if (primitive.attributes.find("NORMAL") != primitive.attributes.end()) {
                 const tinygltf::Accessor& normAccessor = model.accessors[primitive.attributes.at("NORMAL")];
                 const tinygltf::BufferView& normView = model.bufferViews[normAccessor.bufferView];
                 const tinygltf::Buffer& normBuffer = model.buffers[normView.buffer];
                 normals = reinterpret_cast<const float*>(&normBuffer.data[normView.byteOffset + normAccessor.byteOffset]);
+            }
+
+            // TEXCOORD_0
+            const float* texcoords = nullptr;
+            if (primitive.attributes.find("TEXCOORD_0") != primitive.attributes.end())
+            {
+                const tinygltf::Accessor& uvAccessor = model.accessors[primitive.attributes.at("TEXCOORD_0")];
+                const tinygltf::BufferView& uvView = model.bufferViews[uvAccessor.bufferView];
+                texcoords = reinterpret_cast<const float*>(&model.buffers[uvView.buffer].data[uvView.byteOffset + uvAccessor.byteOffset]);
+            }
+
+            // Resolve material to base-color image index
+            int texIndex = -1;
+            if (primitive.material >= 0)
+            {
+                const auto& mat = model.materials[primitive.material];
+                int gltfTexIdx = mat.pbrMetallicRoughness.baseColorTexture.index;
+                if (gltfTexIdx >= 0)
+                {
+                    texIndex = model.textures[gltfTexIdx].source;
+                }
             }
 
             uint32_t vertexOffset = outVertices.size();
@@ -123,6 +150,10 @@ void processGLTFNode(const tinygltf::Model& model, int nodeIndex, const float* p
                         rv.nx /= len; rv.ny /= len; rv.nz /= len;
                     }
                 }
+
+                rv.u = texcoords ? texcoords[i * 2 + 0] : 0.0f;
+                rv.v = texcoords ? texcoords[i * 2 + 1] : 0.0f;
+
                 outRenderVertices.push_back(rv);
             }
 
@@ -158,11 +189,17 @@ void processGLTFNode(const tinygltf::Model& model, int nodeIndex, const float* p
                     outRenderIndices.push_back(vertexOffset + (uint32_t)i); outRenderIndices.push_back(vertexOffset + (uint32_t)i + 1); outRenderIndices.push_back(vertexOffset + (uint32_t)i + 2);
                 }
             }
+
+            MeshDrawGroup group;
+            group.indexStart = indexStart;
+            group.indexCount = (uint32_t)outRenderIndices.size() - indexStart;
+            group.textureIndex = texIndex;
+            outDrawGroups.push_back(group);
         }
     }
 
     for (int childIndex : node.children) {
-        processGLTFNode(model, childIndex, globalMatrix, outVertices, outTriangles, outRenderVertices, outRenderIndices, scale);
+        processGLTFNode(model, childIndex, globalMatrix, outVertices, outTriangles, outRenderVertices, outRenderIndices, scale, outDrawGroups);
     }
 }
 
@@ -171,7 +208,11 @@ bool loadMeshRawData(const std::string& filepath,
                      std::vector<std::array<int, 3>>& outTriangles,
                      std::vector<PosColorVertex>& outRenderVertices,
                      std::vector<uint32_t>& outRenderIndices,
-                     float scale = 1.0f) {
+                     float scale,
+                     std::vector<MeshDrawGroup>& outDrawGroups,
+                     std::vector<std::vector<uint8_t>>& outTexPixels,
+                     std::vector<int>& outTexWidths,
+                     std::vector<int>& outTexHeights) {
     std::string ext = filepath.substr(filepath.find_last_of('.') + 1);
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
@@ -213,6 +254,7 @@ bool loadMeshRawData(const std::string& filepath,
         }
 
         for (const auto& shape : shapes) {
+            uint32_t shapeIndexStart = (uint32_t)outRenderIndices.size();
             for (size_t i = 0; i < shape.mesh.indices.size(); i += 3) {
                 int i0 = shape.mesh.indices[i+0].vertex_index;
                 int i1 = shape.mesh.indices[i+1].vertex_index;
@@ -221,6 +263,11 @@ bool loadMeshRawData(const std::string& filepath,
                 outTriangles.push_back({i0, i1, i2});
                 outRenderIndices.push_back(i0); outRenderIndices.push_back(i1); outRenderIndices.push_back(i2);
             }
+            MeshDrawGroup group;
+            group.indexStart = shapeIndexStart;
+            group.indexCount = (uint32_t)outRenderIndices.size() - shapeIndexStart;
+            group.textureIndex = -1;
+            outDrawGroups.push_back(group);
         }
         return true;
     }
@@ -245,10 +292,21 @@ bool loadMeshRawData(const std::string& filepath,
 
         for (int nodeIndex : scene.nodes)
         {
-            processGLTFNode(model, nodeIndex, identity, outVertices, outTriangles, outRenderVertices, outRenderIndices, scale);
+            processGLTFNode(model, nodeIndex, identity, outVertices, outTriangles, outRenderVertices,
+                outRenderIndices, scale, outDrawGroups);
         }
+
+        for (const auto& img : model.images)
+        {
+            outTexPixels.push_back(img.image);
+            outTexWidths.push_back(img.width);
+            outTexHeights.push_back(img.height);
+        }
+
         return true;
     }
+
+    return false;
 }
 
 static void precompute_coords_avx512(double* __restrict__ out, double minVal, double maxVal, int resolution) noexcept
@@ -322,7 +380,8 @@ MeshSDFData generateSDFFromMesh(const std::string& filepath, int resolution = 64
     std::vector<std::array<double, 3>> vertices;
     std::vector<std::array<int, 3>> triangles;
 
-    if (!loadMeshRawData(filepath, vertices, triangles, result.renderVertices, result.renderIndices, scale)) {
+    if (!loadMeshRawData(filepath, vertices, triangles, result.renderVertices, result.renderIndices, scale,
+        result.drawGroups, result.texturePixels, result.textureWidths, result.textureHeights)) {
         return result;
     }
 
@@ -352,6 +411,7 @@ MeshSDFData generateSDFFromMesh(const std::string& filepath, int resolution = 64
     std::cout << "SDF Generation complete.\n";
     return result;
 }
+
 
 void createSDFTextureObject(const MeshSDFData& sdfData, cudaTextureObject_t& outTex, cudaArray_t& outArray) {
     cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
@@ -439,13 +499,17 @@ private:
     void initColliderRendering();
     void renderParticles(bgfx::ViewId viewId, bgfx::ProgramHandle program, uint64_t renderState);
     void renderFluidPasses();
+    void renderFoam();
     void renderColliders();
+    void renderSkybox();
     void renderImGui();
     void generateSphereTemplate(int stacks, int slices);
     void drawFullscreenQuad(bgfx::ViewId viewId, bgfx::ProgramHandle program, uint64_t renderState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A);
     void renderFluidComposite();
     void generateCubeTemplate();
     void updateCamera();
+
+    bgfx::TextureHandle createWhiteTexture();
 
     // Scene methods
     void buildSceneList();
@@ -460,7 +524,6 @@ private:
     bool m_showStats = false;
     bool m_showParamEditor = true;
     bool m_showRenderEditor = true;
-    const bgfx::ViewId m_kClearView = 0;
     int m_activeScene = 0;
 
     // Camera
@@ -484,6 +547,9 @@ private:
     std::vector<PosColorVertex> m_circleTemplate;
     std::vector<uint32_t> m_circleIndices;
 
+    // White particle program
+    bgfx::ProgramHandle m_foamProgram;
+
     // Cube collider rendering data
     bgfx::VertexBufferHandle m_cubeVB;
     bgfx::IndexBufferHandle m_cubeIB;
@@ -491,6 +557,11 @@ private:
     // Mesh rendering data
     bgfx::VertexBufferHandle m_meshVB;
     bgfx::IndexBufferHandle m_meshIB;
+
+    // Scene textures
+    std::vector<bgfx::TextureHandle> m_terrainTextures;
+    std::vector<MeshDrawGroup> m_terrainDrawGroups;
+    bgfx::UniformHandle m_albedoSampler = BGFX_INVALID_HANDLE;
 
     // Per-scene bgfx handles
     bgfx::VertexBufferHandle m_terrainVB = BGFX_INVALID_HANDLE;
@@ -501,19 +572,39 @@ private:
     bgfx::TextureHandle m_hwDepthTexture = BGFX_INVALID_HANDLE;
     bgfx::FrameBufferHandle m_depthFbo = BGFX_INVALID_HANDLE;
     bgfx::ProgramHandle m_depthProgram = BGFX_INVALID_HANDLE;
-    const bgfx::ViewId m_kDepthPassView = 1;
 
     // Depth program test
     bgfx::UniformHandle m_depthSampler;
     bgfx::ProgramHandle m_debugDepthProgram = BGFX_INVALID_HANDLE;
 
+    // Scene color
+    bgfx::TextureHandle m_sceneColorTexture = BGFX_INVALID_HANDLE;
+    bgfx::FrameBufferHandle m_sceneFbo = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle m_sceneSampler = BGFX_INVALID_HANDLE;
+
+    // Terrain mesh program
+    bgfx::ProgramHandle m_meshProgram = BGFX_INVALID_HANDLE;
+    bgfx::TextureHandle m_whiteFallbackTexture = BGFX_INVALID_HANDLE;
+
+    // Skybox
+    bgfx::ProgramHandle m_skyboxProgram = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle m_skyboxSampler = BGFX_INVALID_HANDLE;
+    bgfx::TextureHandle m_skyboxTexture = BGFX_INVALID_HANDLE;
+    bgfx::VertexBufferHandle m_skyboxVB = BGFX_INVALID_HANDLE;
+    bgfx::IndexBufferHandle m_skyboxIB = BGFX_INVALID_HANDLE;
+
     // Gaussian blur
     float m_fluidBlurSmoothness = 1.0f;
     float m_fluidBlurSize = 10.0f;
     float m_fluidDepthFactor = 1.0f;
-    const bgfx::ViewId m_kBlurXPassView = 2;
-    const bgfx::ViewId m_kBlurYPassView = 3;
-    const bgfx::ViewId m_kCompositePassView = 5;
+
+    const bgfx::ViewId m_kClearView = 0;
+    const bgfx::ViewId m_kSkyboxView = 1;
+    const bgfx::ViewId m_kDepthPassView = 2;
+    const bgfx::ViewId m_kBlurXPassView = 3;
+    const bgfx::ViewId m_kBlurYPassView = 4;
+    bgfx::ViewId m_kThicknessPassView = 5;
+    const bgfx::ViewId m_kCompositePassView = 6;
 
     bgfx::ProgramHandle m_blurProgram = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle m_blurParamsUniform = BGFX_INVALID_HANDLE;
@@ -531,7 +622,6 @@ private:
     bgfx::ProgramHandle m_compositeProgram = BGFX_INVALID_HANDLE;
 
     // Thickness
-    bgfx::ViewId m_kThicknessPassView = 4;
     bgfx::ProgramHandle m_thicknessProgram = BGFX_INVALID_HANDLE;
     bgfx::TextureHandle m_thicknessTexture = BGFX_INVALID_HANDLE;
     bgfx::FrameBufferHandle m_thicknessFrameBuffer = BGFX_INVALID_HANDLE;
@@ -541,7 +631,9 @@ private:
     float* m_particlePositions = nullptr;
     float* m_particleVelocities = nullptr;
     std::vector<uint32_t> m_particleColors;
-    float m_particleRadius = 0.1f;
+    float m_particleRadius = 0.06f;
+    std::vector<WhiteParticle> m_whiteParticles;
+    uint32_t m_maxWhiteParticles = WHITE_PARTICLE_MAX;
 
     // Scene list
     std::vector<SceneDef> m_scenes;
@@ -549,6 +641,13 @@ private:
     // SPH class
     SPHSolver* m_solver = nullptr;
 };
+
+bgfx::TextureHandle AnitoWave::createWhiteTexture()
+{
+    static uint8_t white[4] = { 0xff, 0xff, 0xff, 0xff };
+    const bgfx::Memory* mem = bgfx::copy(white, sizeof(white));
+    return bgfx::createTexture2D(1, 1, false, 1, bgfx::TextureFormat::RGBA8, 0, mem);
+}
 
 void AnitoWave::buildSceneList()
 {
@@ -568,8 +667,8 @@ void AnitoWave::buildSceneList()
 
         empty.gravity = 10;
         empty.targetDensity = 650.0f;
-        empty.pressureMultiplier = 550.0f;
-        empty.viscosityStrength = 10.00f;
+        empty.pressureMultiplier = 350.0f;
+        empty.viscosityStrength = 3.0f;
 
         m_scenes.push_back(empty);
     }
@@ -633,7 +732,7 @@ void AnitoWave::buildSceneList()
         sponza.spawnOffsetY = 25.0f;
         sponza.gravity = 0.f;
         sponza.targetDensity = 650.0f;
-        sponza.pressureMultiplier = 150.0f;
+        sponza.pressureMultiplier = 350.0f;
         sponza.viscosityStrength = 1.0f;
         m_scenes.push_back(sponza);
     }
@@ -695,6 +794,10 @@ void AnitoWave::unloadCurrentScene()
     if (bgfx::isValid(m_terrainVB)) { bgfx::destroy(m_terrainVB); m_terrainVB = BGFX_INVALID_HANDLE; }
     if (bgfx::isValid(m_terrainIB)) { bgfx::destroy(m_terrainIB); m_terrainIB = BGFX_INVALID_HANDLE; }
 
+    for (auto& tex : m_terrainTextures) { bgfx::destroy(tex); }
+    m_terrainTextures.clear();
+    m_terrainDrawGroups.clear();
+
     if (m_particlePositions) { cudaFreeHost(m_particlePositions); m_particlePositions = nullptr; }
     if (m_particleVelocities) { cudaFreeHost(m_particleVelocities); m_particleVelocities = nullptr; }
 }
@@ -739,6 +842,23 @@ void AnitoWave::loadScene(int index)
         );
 
         createSDFTextureObject(terrainData, terrainTex, terrainArr);
+
+        m_terrainDrawGroups = terrainData.drawGroups;
+
+        m_terrainTextures.resize(terrainData.texturePixels.size(), BGFX_INVALID_HANDLE);
+        for (size_t i = 0; i < terrainData.texturePixels.size(); ++i)
+        {
+            const auto& pixels = terrainData.texturePixels[i];
+            if (pixels.empty()) continue;
+            int w = terrainData.textureWidths[i];
+            int h = terrainData.textureHeights[i];
+            const bgfx::Memory* mem = bgfx::copy(pixels.data(), (uint32_t)(w * h * 4));
+            m_terrainTextures[i] = bgfx::createTexture2D(
+                (uint16_t)w, (uint16_t)h, false,  1,
+                bgfx::TextureFormat::RGBA8,
+                BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
+                mem);
+        }
     }
 
     const int N = scene.particlesPerSide;
@@ -845,6 +965,8 @@ AnitoWave::~AnitoWave() {
         m_particleVelocities = nullptr;
     }
 
+    m_whiteParticles.clear();
+
     if (m_window) {
         bgfx::shutdown();
         glfwTerminate();
@@ -856,6 +978,7 @@ void AnitoWave::initStaticRenderResources() {
         .add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float)
         .add(bgfx::Attrib::Normal, 3, bgfx::AttribType::Float)
         .add(bgfx::Attrib::Color0, 4, bgfx::AttribType::Uint8, true)
+        .add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float)
         .end();
 
     m_instanceLayout.begin()
@@ -873,10 +996,14 @@ void AnitoWave::initStaticRenderResources() {
         BGFX_BUFFER_INDEX32
     );
 
+    m_sceneSampler = bgfx::createUniform("s_sceneColor", bgfx::UniformType::Sampler);
+    m_albedoSampler = bgfx::createUniform("s_albedo", bgfx::UniformType::Sampler);
+    m_whiteFallbackTexture = createWhiteTexture();
+
     initColliderRendering();
 
     m_program = loadProgram("vs_fluid_particles", "fs_fluid_particles");
-
+    m_meshProgram = loadProgram("vs_mesh", "fs_mesh");
     m_depthProgram = loadProgram("vs_fluid_depth", "fs_fluid_depth");
     m_debugDepthProgram = loadProgram("vs_fullscreen", "fs_debug_depth");
 
@@ -886,6 +1013,8 @@ void AnitoWave::initStaticRenderResources() {
 
     m_compositeProgram = loadProgram("vs_fullscreen", "fs_fluid_composite");
     m_texelSizeUniform = bgfx::createUniform("u_texelSize", bgfx::UniformType::Vec4);
+
+    m_foamProgram = loadProgram("vs_foam_particles", "fs_fluid_foam");
 
     m_thicknessProgram = loadProgram("vs_fluid_thickness", "fs_fluid_thickness");
     m_thicknessTexture = bgfx::createTexture2D(
@@ -899,6 +1028,53 @@ void AnitoWave::initStaticRenderResources() {
     bgfx::setViewFrameBuffer(m_kThicknessPassView, m_thicknessFrameBuffer);
 
     m_particleRadiusUniform = bgfx::createUniform("u_particleRadius", bgfx::UniformType::Vec4);
+
+    // Skybox
+    m_skyboxTexture = bgfx::createTexture(
+    loadMemoryFromFile("textures/skybox.dds"),
+    BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_W_CLAMP
+    );
+
+    m_skyboxSampler = bgfx::createUniform("s_skybox", bgfx::UniformType::Sampler);
+    m_skyboxProgram = loadProgram("vs_skybox", "fs_skybox");
+
+    bgfx::setViewFrameBuffer(m_kSkyboxView, m_sceneFbo);
+    bgfx::setViewRect(m_kSkyboxView, 0, 0, m_width, m_height);
+    bgfx::setViewClear(m_kSkyboxView, BGFX_CLEAR_NONE);
+
+    bgfx::VertexLayout skyboxLayout;
+    skyboxLayout.begin()
+        .add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float)
+        .end();
+
+    static const float s_skyboxVertices[] = {
+        -1.0f,  1.0f,  1.0f, // Top-Left-Front
+         1.0f,  1.0f,  1.0f, // Top-Right-Front
+        -1.0f, -1.0f,  1.0f, // Bottom-Left-Front
+         1.0f, -1.0f,  1.0f, // Bottom-Right-Front
+        -1.0f,  1.0f, -1.0f, // Top-Left-Back
+         1.0f,  1.0f, -1.0f, // Top-Right-Back
+        -1.0f, -1.0f, -1.0f, // Bottom-Left-Back
+         1.0f, -1.0f, -1.0f  // Bottom-Right-Back
+    };
+
+    static const uint16_t s_skyboxIndices[] = {
+        0, 2, 1,   1, 2, 3, // Front
+        5, 7, 4,   4, 7, 6, // Back
+        4, 0, 5,   5, 0, 1, // Top
+        2, 6, 3,   3, 6, 7, // Bottom
+        1, 3, 5,   5, 3, 7, // Right
+        4, 6, 0,   0, 6, 2  // Left
+    };
+
+    m_skyboxVB = bgfx::createVertexBuffer(
+        bgfx::makeRef(s_skyboxVertices, sizeof(s_skyboxVertices)),
+        skyboxLayout
+    );
+
+    m_skyboxIB = bgfx::createIndexBuffer(
+        bgfx::makeRef(s_skyboxIndices, sizeof(s_skyboxIndices))
+    );
 }
 
 void AnitoWave::initColliderRendering() {
@@ -1030,6 +1206,12 @@ void AnitoWave::updateCamera() {
     bx::mtxLookAt(view, {eye.x, eye.y, eye.z}, {at.x, at.y, at.z}, {up.x, up.y, up.z});
     bx::mtxProj(proj, 60.0f, aspect, 0.1f, 100.0f, bgfx::getCaps()->homogeneousDepth);
 
+    float skyView[16];
+    memcpy(skyView, view, sizeof(view));
+    skyView[12] = 0.f; skyView[13] = 0.f; skyView[14] = 0.f;
+    bgfx::setViewTransform(m_kSkyboxView, skyView, proj);
+
+
     bgfx::setViewTransform(m_kClearView, view, proj);
     bgfx::setViewTransform(m_kDepthPassView, view, proj);
     bgfx::setViewTransform(m_kCompositePassView, view, proj);
@@ -1077,6 +1259,8 @@ void AnitoWave::renderFluidComposite()
     // Read from Blur Y, output to screen
     bgfx::setTexture(0, m_depthSampler, m_blurYTexture);
     bgfx::setTexture(1, m_thicknessSampler, m_thicknessTexture);
+    bgfx::setTexture(2, m_sceneSampler, m_sceneColorTexture);
+
     uint64_t compositeState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_BLEND_ALPHA;
     drawFullscreenQuad(m_kCompositePassView, m_compositeProgram, compositeState);
 }
@@ -1183,22 +1367,70 @@ void AnitoWave::renderFluidPasses() {
     }
 }
 
+void AnitoWave::renderFoam()
+{
+    if (m_whiteParticles.empty()) return;
+
+    std::vector<ParticleInstance> instances;
+    instances.reserve(m_whiteParticles.size());
+    for (const auto& wp : m_whiteParticles)
+    {
+        instances.push_back({
+            wp.position.x, wp.position.y, wp.position.z, 0.0f,
+            0.0f, 0.0f, 0.0f, wp.remainingLifetime
+        });
+    }
+
+    uint32_t count = (uint32_t)instances.size();
+    uint32_t maxAvailable = bgfx::getAvailInstanceDataBuffer(count, m_instanceLayout.getStride());
+    uint32_t offset = 0;
+
+    while (offset < count)
+    {
+        uint32_t batch = bx::min(maxAvailable, count - offset);
+        bgfx::InstanceDataBuffer idb{};
+        bgfx::allocInstanceDataBuffer(&idb, batch, m_instanceLayout.getStride());
+
+        if (idb.data != NULL)
+        {
+            memcpy(idb.data, &instances[offset], batch * sizeof(ParticleInstance));
+
+            float radiusData[4] = { m_particleRadius, 0.0f, 0.0f, 0.0f };
+            bgfx::setUniform(m_particleRadiusUniform, radiusData);
+
+            bgfx::setVertexBuffer(0, m_circleVB);
+            bgfx::setIndexBuffer(m_circleIB);
+            bgfx::setInstanceDataBuffer(&idb);
+
+            bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_WRITE_Z
+             | BGFX_STATE_DEPTH_TEST_LESS);
+            bgfx::submit(m_kClearView, m_foamProgram);
+
+            offset += batch;
+        } else
+        {
+            fprintf(stderr, "Foam instance buffer allocation failed.\n");
+            break;
+        }
+    }
+}
+
 void AnitoWave::renderColliders() {
     if (!m_solver) return;
 
     std::vector<Collider> colliders;
     m_solver->getColliders(colliders);
 
-    float defaultRadius[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
-    bgfx::setUniform(m_particleRadiusUniform, defaultRadius);
-
-    bgfx::InstanceDataBuffer idb{};
-    if (bgfx::getAvailInstanceDataBuffer(1, m_instanceLayout.getStride()) > 0) {
-        bgfx::allocInstanceDataBuffer(&idb, 1, m_instanceLayout.getStride());
-        ParticleInstance* data = (ParticleInstance*)idb.data;
-        data[0].x = 0.0f; data[0].y = 0.0f; data[0].z = 0.0f; data[0].pad0 = 0.0f;
-        data[0].vx = 1.0f; data[0].vy = 1.0f; data[0].vz = 1.0f; data[0].pad1 = 1.0f;
-    }
+    // float defaultRadius[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+    // bgfx::setUniform(m_particleRadiusUniform, defaultRadius);
+    //
+    // bgfx::InstanceDataBuffer idb{};
+    // if (bgfx::getAvailInstanceDataBuffer(1, m_instanceLayout.getStride()) > 0) {
+    //     bgfx::allocInstanceDataBuffer(&idb, 1, m_instanceLayout.getStride());
+    //     ParticleInstance* data = (ParticleInstance*)idb.data;
+    //     data[0].x = 0.0f; data[0].y = 0.0f; data[0].z = 0.0f; data[0].pad0 = 0.0f;
+    //     data[0].vx = 1.0f; data[0].vy = 1.0f; data[0].vz = 1.0f; data[0].pad1 = 1.0f;
+    // }
 
     for (const auto& col : colliders) {
         float mtx[16];
@@ -1220,18 +1452,51 @@ void AnitoWave::renderColliders() {
         } else if (col.type == TYPE_MESH) {
             bx::mtxScale(mtxScale, 1.0f, 1.0f, 1.0f);
             bx::mtxMul(mtx, mtxScale, mtxTrans);
-            bgfx::setVertexBuffer(0, m_terrainVB);
-            bgfx::setIndexBuffer(m_terrainIB);
+
+            for (const auto& group : m_terrainDrawGroups)
+            {
+                bgfx::setVertexBuffer(0, m_terrainVB);
+                bgfx::setIndexBuffer(m_terrainIB, group.indexStart, group.indexCount);
+
+                bgfx::TextureHandle tex = m_whiteFallbackTexture;
+                if (group.textureIndex >= 0 &&
+                    group.textureIndex < (int)m_terrainTextures.size() &&
+                    bgfx::isValid(m_terrainTextures[group.textureIndex]))
+                {
+                    tex = m_terrainTextures[group.textureIndex];
+                }
+
+                bgfx::setTexture(0, m_albedoSampler, tex);
+                bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A |
+                               BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS);
+                bgfx::submit(m_kClearView, m_meshProgram);
+            }
         }
 
         bgfx::setTransform(mtx);
 
-        bgfx::setInstanceDataBuffer(&idb);
+        // bgfx::setInstanceDataBuffer(&idb);
 
         bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS);
 
-        bgfx::submit(m_kClearView, m_program);
+        bgfx::submit(m_kClearView, m_meshProgram);
     }
+}
+
+void AnitoWave::renderSkybox()
+{
+    bgfx::setTexture(0, m_skyboxSampler, m_skyboxTexture);
+    bgfx::setVertexBuffer(0, m_skyboxVB);
+    bgfx::setIndexBuffer(m_skyboxIB);
+
+    float identity[16]; bx::mtxIdentity(identity);
+    bgfx::setTransform(identity);
+
+    uint64_t state = BGFX_STATE_WRITE_RGB
+    | BGFX_STATE_DEPTH_TEST_LEQUAL;
+
+    bgfx::setState(state);
+    bgfx::submit(m_kSkyboxView, m_skyboxProgram);
 }
 
 void AnitoWave::renderImGui() {
@@ -1398,9 +1663,19 @@ bool AnitoWave::init() {
     m_hwDepthTexture = fbTextures[1];
     // Bind both to the FBO
     m_depthFbo = bgfx::createFrameBuffer(2, fbTextures, true);
+    m_sceneColorTexture = bgfx::createTexture2D(m_width, m_height, false, 1, bgfx::TextureFormat::RGBA8,
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+
+    bgfx::TextureHandle sceneAttachments[] = { m_sceneColorTexture, m_hwDepthTexture};
+    m_sceneFbo = bgfx::createFrameBuffer(BX_COUNTOF(sceneAttachments), sceneAttachments, false);
+
+    // Target FBO with clear view
+    bgfx::setViewClear(m_kClearView, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x303030ff, 1.0f, 0);
+    bgfx::setViewFrameBuffer(m_kClearView, m_sceneFbo);
+    bgfx::setViewRect(m_kClearView, 0, 0, m_width, m_height);
 
     // Configure the View
-    bgfx::setViewClear(m_kDepthPassView, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x00000000, 1.0f, 0);
+    bgfx::setViewClear(m_kDepthPassView, BGFX_CLEAR_COLOR, 0x00000000, 1.0f, 0);
     bgfx::setViewFrameBuffer(m_kDepthPassView, m_depthFbo);
     bgfx::setViewRect(m_kDepthPassView, 0, 0, m_width, m_height);
 
@@ -1482,8 +1757,11 @@ void AnitoWave::run() {
 
         m_solver->getPositions(m_particlePositions);
         m_solver->getVelocities(m_particleVelocities);
+        m_solver->requestWhiteParticles();
 
         cudaStreamSynchronize(0);
+
+        m_solver->finalizeWhiteParticles(m_whiteParticles);
 
         // uint64_t depthState = BGFX_STATE_WRITE_R | BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS;
         // renderParticles(m_kDepthPassView, m_depthProgram, depthState);
@@ -1493,7 +1771,12 @@ void AnitoWave::run() {
         renderFluidPasses();
 
         renderColliders();
+        renderSkybox();
         renderFluidComposite();
+        renderFoam();
+
+        // uint64_t whiteState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS;
+        // renderParticles(m_kClearView, m_foamProgram, whiteState);
 
         renderImGui();
 
