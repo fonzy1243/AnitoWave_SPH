@@ -4,6 +4,7 @@ $input v_uv
 
 SAMPLER2D(s_depth, 0);
 SAMPLER2D(s_thickness, 1);
+SAMPLER2D(s_sceneColor, 2);
 
 uniform vec4 u_texelSize;
 
@@ -22,12 +23,13 @@ vec3 ViewPos(vec2 uv)
 void main()
 {
     float centerDepth = texture2D(s_depth, v_uv).r;
+    vec4 sceneColor = texture2D(s_sceneColor, v_uv);
 
     // Discard background pixels
     if (centerDepth <= 0.0)
     {
         // Output background color (e.g., dark gray)
-        gl_FragColor = vec4(0.2, 0.2, 0.2, 1.0);
+        gl_FragColor = sceneColor;
         return;
     }
 
@@ -49,7 +51,7 @@ void main()
     // ======= Lighting ========
     vec3 worldViewDir = normalize(mul(u_invView, vec4(posCenter, 0.0)).xyz);
     float rawThickness = texture2D(s_thickness, v_uv).r;
-    float thicknessMultiplier = 0.05;
+    float thicknessMultiplier = 0.35;
     float thickness = rawThickness * thicknessMultiplier;
     float edgeMask = smoothstep(0.0, 0.01, thickness);
 
@@ -57,19 +59,25 @@ void main()
     float iorFluid = 1.333;
     vec3 refractDir = refract(worldViewDir, worldNormal, iorAir / iorFluid);
 
-    vec3 extinctionCoefficients = vec3(1.5, 0.47, 0.57);
-
+    vec3 extinctionCoefficients = vec3(2.5, 0.8, 0.35);
     float transmittance = exp(-thickness * extinctionCoefficients);
 
+    // Refraction
     float refractionMultiplier = 0.76;
-    vec3 exitPos = posCenter + (refractDir * thickness * refractionMultiplier);
+    vec2 refractOffset = refractDir.xy * thickness * refractionMultiplier;
 
-    vec3 floorCol = vec3(0.4, 0.4, 0.4);
-    vec3 deepTrenchCol = vec3(0.05, 0.1, 0.15);
-    vec3 fakeBackgroundCol = mix(deepTrenchCol, floorCol, clamp((exitPos.y + 10.0) / 20.0, 0.0, 1.0));
+    float maxOffset = 0.14;
+    refractOffset = refractOffset * min(1.0, maxOffset);
 
-    vec3 ambientScatterCol = vec3(0.1, 0.3, 0.4);
-    vec3 refractCol = mix(ambientScatterCol, fakeBackgroundCol, transmittance);
+    vec2 refractUV = clamp(v_uv + refractOffset, 0.0, 1.0);
+    float dispersion = min(length(refractOffset), maxOffset) * 0.08;
+    float r = texture2D(s_sceneColor, clamp(v_uv + refractOffset * (1.0 + dispersion), 0.0, 1.0)).r;
+    float g = texture2D(s_sceneColor, clamp(v_uv + refractOffset,                      0.0, 1.0)).g;
+    float b = texture2D(s_sceneColor, clamp(v_uv + refractOffset * (1.0 - dispersion), 0.0, 1.0)).b;
+    vec3 backgroundCol = vec3(r, g, b);
+
+    vec3 ambientScatterCol = vec3(0.04, 0.18, 0.35);
+    vec3 refractCol = mix(ambientScatterCol, backgroundCol, transmittance);
 
     // Reflection
     vec3 reflectDir = reflect(worldViewDir, worldNormal);
@@ -81,7 +89,6 @@ void main()
     float f0 = pow((iorAir - iorFluid) / (iorAir + iorFluid), 2.0);
     float facingRatio = max(dot(-worldViewDir, worldNormal), 0.0);
     float fresnel = f0 + (1.0 - f0) * pow(1.0 - facingRatio, 5.0);
-    fresnel = min(fresnel, 0.85) * edgeMask;
 
     vec3 finalColor = mix(refractCol, reflectCol, fresnel);
 
@@ -91,7 +98,7 @@ void main()
     float specular = pow(max(dot(worldNormal, halfVector), 0.0), 200.0) * edgeMask;
 
     finalColor += vec3(1.0, 1.0, 1.0) * specular;
-    float alpha = smoothstep(0.0, 0.1, rawThickness);
 
-    gl_FragColor = vec4(finalColor, alpha);
+    float alpha = smoothstep(0.0, 0.1, rawThickness) * edgeMask;
+    gl_FragColor = vec4(mix(sceneColor.rgb, finalColor, alpha), 1.0);
 }

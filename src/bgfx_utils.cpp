@@ -33,6 +33,7 @@ static void* loadMem(bx::FileReaderI* _reader, bx::AllocatorI* _allocator, const
     return NULL;
 }
 
+
 static bgfx::ShaderHandle loadShader(bx::FileReaderI* _reader, const bx::StringView& _name)
 {
     bx::FilePath filePath("shaders/");
@@ -66,6 +67,12 @@ static bgfx::ShaderHandle loadShader(bx::FileReaderI* _reader, const bx::StringV
     bgfx::setName(handle, _name.getPtr(), _name.getLength() );
 
     return handle;
+}
+
+const bgfx::Memory* loadMemoryFromFile(const bx::StringView& _filePath)
+{
+    bx::FileReader reader;
+    return loadMem(&reader, _filePath);
 }
 
 bgfx::ShaderHandle loadShader(const bx::StringView& _name)

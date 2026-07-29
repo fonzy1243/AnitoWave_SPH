@@ -177,6 +177,29 @@ __device__ void atomicAddFloat3(float3* address, float3 val) {
     atomicAdd(&address->z, val.z);
 }
 
+__device__ uint32_t randomState(float3 pos, float simTime) {
+    uint32_t ux = __float_as_uint(pos.x);
+    uint32_t uy = __float_as_uint(pos.y);
+    uint32_t uz = __float_as_uint(pos.z);
+    uint32_t ut = __float_as_uint(simTime);
+
+    return ux * 19349669u
+         + uy * 83492837u
+         + uz * 73856131u
+         + ut * 4785773u;
+}
+
+__device__ float randomValue(uint32_t& rngState) {
+    rngState ^= rngState << 13;
+    rngState ^= rngState >> 17;
+    rngState ^= rngState << 5;
+    return (rngState & 0x00FFFFFFu) / (float)0x01000000u;
+}
+
+__device__ float lerpf(float a, float b, float t) {
+    return a + t * (b - a);
+}
+
 __device__ float sdfSphere(float3 p, float r) {
     return length(p) - r;
 }
@@ -324,6 +347,18 @@ __device__ float3 CalculateColliderNormal(float3 p, Collider c) {
     return n / length(n);
 }
 
+__device__ float3 CalculateBoundsNormal(float3 p, float3 halfSize)
+{
+    const float e = 0.001f;
+    float d = -sdfBox(p, halfSize);
+    float x = (-sdfBox(make_float3(p.x + e, p.y, p.z), halfSize)) - d;
+    float y = (-sdfBox(make_float3(p.x, p.y + e, p.z), halfSize)) - d;
+    float z = (-sdfBox(make_float3(p.x, p.y, p.z + e), halfSize)) - d;
+    float3 n = make_float3(x, y, z);
+    float len = length(n);
+    return len > 1e-6f ? n / len : make_float3(0, 1, 0);
+}
+
 __device__ float3 GetRandomDir(uint32_t id) {
     float x = sinf(id * 12.9898f);
     float y = cosf(id * 78.233f);
@@ -411,6 +446,25 @@ __device__ float NearDensityDerivativeKernel(float dst, float radius, float scal
     return -v * v * scale;
 }
 
+__device__ float clampf(float val, float lo, float hi) {
+    return fmaxf(lo, fminf(hi, val));
+}
+
+__device__ float3 cross_f3(float3 a, float3 b)
+{
+    return make_float3(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    );
+}
+
+__device__ float3 normalize_f3(float3 v)
+{
+    float len = length(v);
+    return len > 0.000001f ? v / len : make_float3(0.0f, 1.0f, 0.0f);
+}
+
 __global__
 // __launch_bounds__(256, 2)
 void ApplyPressureForces_Optimized(
@@ -420,6 +474,7 @@ void ApplyPressureForces_Optimized(
     float* velX, float* velY, float* velZ,
     const float* __restrict__ densities,
     const float* __restrict__ nearDensities,
+    float* trappedAir,
     const uint32_t* __restrict__ spatialIndices,
     const uint32_t* __restrict__ spatialKeys,
     const uint32_t* __restrict__ startIndices,
@@ -445,6 +500,9 @@ void ApplyPressureForces_Optimized(
 
     float3 samplePos, myVel;
     float  myDensity, myNearDensity;
+
+    float weightedVelocityDifference = 0.0f;
+    // trappedAir[i] = 0.0f;
 
     if (i < numParticles) {
         samplePos     = make_float3(__ldg(&predX[i]),
@@ -513,6 +571,14 @@ void ApplyPressureForces_Optimized(
 
                 float influence = ViscositySmoothingKernel(dst, smoothingRadius, viscosityScale);
                 viscosityForce += (otherVel - myVel) * influence;
+
+                // Trapped air calculation
+                float3 relativeVelocity = myVel - otherVel;
+                float relVelMag = length(relativeVelocity);
+                float3 relVelDir = relativeVelocity / max(0.000001f, relVelMag);
+                float convergeWeight = (1.0f - dot(relVelDir, -dir)) * 0.5f;
+                float t_influence = 1.0f - min(1.0f, dst / smoothingRadius);
+                weightedVelocityDifference += relVelMag * convergeWeight * t_influence;
             }
         }
     }
@@ -566,6 +632,14 @@ void ApplyPressureForces_Optimized(
 
                     float influence = ViscositySmoothingKernel(dst, smoothingRadius, viscosityScale);
                     viscosityForce += (otherVel - myVel) * influence;
+
+                    // Trapped air calculation
+                    float3 relativeVelocity = myVel - otherVel;
+                    float relVelMag = length(relativeVelocity);
+                    float3 relVelDir = relativeVelocity / max(0.000001f, relVelMag);
+                    float convergeWeight = (1.0f - dot(relVelDir, -dir)) * 0.5f;
+                    float t_influence = 1.0f - min(1.0f, dst / smoothingRadius);
+                    weightedVelocityDifference += relVelMag * convergeWeight * t_influence;
                 }
             }
         }
@@ -583,6 +657,7 @@ void ApplyPressureForces_Optimized(
     velX[i] = finalVel.x;
     velY[i] = finalVel.y;
     velZ[i] = finalVel.z;
+    trappedAir[i] = weightedVelocityDifference;
 }
 
 __global__ void UpdatePositions(
@@ -657,25 +732,42 @@ __global__ void UpdatePositions(
         }
     }
 
-    const float3 halfSize = make_float3(boundsX / 2, boundsY / 2, boundsZ / 2);
-    const float3 edgeDst = make_float3(
-        halfSize.x - abs(posLocal.x) - particleSize,
-        halfSize.y - abs(posLocal.y) - particleSize,
-        halfSize.z - abs(posLocal.z) - particleSize
-    );
+    const float3 halfSize = make_float3(boundsX / 2.0f, boundsY / 2.0f, boundsZ / 2.0f);
+    float containerDist = -sdfBox(posLocal, halfSize);
 
-    if (edgeDst.x <= 0) {
-        posLocal.x = (halfSize.x - particleSize) * sign(posLocal.x);
-        if (posLocal.x * velLocal.x > 0.0f) velLocal.x *= -1.0f * collisionDamping;
+    if (containerDist < particleSize)
+    {
+        float3 normal = CalculateBoundsNormal(posLocal, halfSize);
+        float penetration = particleSize - containerDist;
+
+        posLocal += normal * penetration;
+
+        float normalVel = dot(velLocal, normal);
+        if (normalVel < 0)
+        {
+            float3 velocityChange = normal * normalVel * (1.0f + collisionDamping);
+            velLocal -= velocityChange;
+        }
     }
-    if (edgeDst.y <= 0) {
-        posLocal.y = (halfSize.y - particleSize) * sign(posLocal.y);
-        if (posLocal.y * velLocal.y > 0.0f) velLocal.y *= -1.0f * collisionDamping;
-    }
-    if (edgeDst.z <= 0) {
-        posLocal.z = (halfSize.z - particleSize) * sign(posLocal.z);
-        if (posLocal.z * velLocal.z > 0.0f) velLocal.z *= -1.0f * collisionDamping;
-    }
+
+    // const float3 edgeDst = make_float3(
+    //     halfSize.x - abs(posLocal.x) - particleSize,
+    //     halfSize.y - abs(posLocal.y) - particleSize,
+    //     halfSize.z - abs(posLocal.z) - particleSize
+    // );
+    //
+    // if (edgeDst.x <= 0) {
+    //     posLocal.x = (halfSize.x - particleSize) * sign(posLocal.x);
+    //     if (posLocal.x * velLocal.x > 0.0f) velLocal.x *= -1.0f * collisionDamping;
+    // }
+    // if (edgeDst.y <= 0) {
+    //     posLocal.y = (halfSize.y - particleSize) * sign(posLocal.y);
+    //     if (posLocal.y * velLocal.y > 0.0f) velLocal.y *= -1.0f * collisionDamping;
+    // }
+    // if (edgeDst.z <= 0) {
+    //     posLocal.z = (halfSize.z - particleSize) * sign(posLocal.z);
+    //     if (posLocal.z * velLocal.z > 0.0f) velLocal.z *= -1.0f * collisionDamping;
+    // }
 
     const float MAX_SPEED = 60.0f;
     float speed = length(velLocal);
@@ -1037,6 +1129,246 @@ __global__ void ReorderVelocities(
 //     }
 // }
 
+__global__ void SpawnWhiteParticles(
+    const float* __restrict__ posX,
+    const float* __restrict__ posY,
+    const float* __restrict__ posZ,
+    const float* __restrict__ velX,
+    const float* __restrict__ velY,
+    const float* __restrict__ velZ,
+    const float* __restrict__ trappedAir,
+    WhiteParticle* whiteParticles,
+    uint32_t* whiteParticleCounters,
+    int numParticles,
+    uint32_t maxWhiteParticleCount,
+    float simTime,
+    float dt,
+    float smoothingRadius,
+    WhiteParticleParams params
+)
+{
+    int id_x = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id_x >= numParticles) return;
+    // Reset survivor counter
+    if (id_x == 0) whiteParticleCounters[1] = 0;
+
+    float3 pos = make_float3(posX[id_x], posY[id_x], posZ[id_x]);
+    float3 vel = make_float3(velX[id_x], velY[id_x], velZ[id_x]);
+    uint32_t rngState = randomState(pos, simTime);
+
+    float ta = trappedAir[id_x];
+    float trappedAirFactor = clampf((ta - params.trappedAirMin) / max(0.000001f,
+        params.trappedAirMax - params.trappedAirMin), 0.0f, 1.0f);
+
+    float ke = dot(vel, vel);
+    float kineticEnergyFactor = clampf((ke - params.kineticEnergyMin) / max(0.000001f,
+        params.kineticEnergyMax - params.kineticEnergyMin), 0.0f, 1.0f);
+
+    float particleSpawnFactor = params.trappedAirSpawnRate * trappedAirFactor * kineticEnergyFactor * dt;
+
+    int particleSpawnCount = (int)floorf(particleSpawnFactor);
+    float fractionalSpawnRemainder = particleSpawnFactor - (float)particleSpawnCount;
+    if (randomValue(rngState) < fractionalSpawnRemainder) particleSpawnCount += 1;
+
+    if (particleSpawnCount > 0) {
+        uint32_t particleIndex;
+        // Atomic add for the whole batch at once
+        particleIndex = atomicAdd(&whiteParticleCounters[0], (uint32_t)particleSpawnCount);
+        particleSpawnCount = min(particleSpawnCount, (int)(maxWhiteParticleCount - particleIndex - 1));
+
+        float3 cylinderBase = pos;
+        float3 cylinderTop  = pos + vel * dt;  // swept position over timestep
+
+        // Build orthonormal basis around velocity direction
+        float velLen = length(vel);
+        float3 velDir = velLen > 0.000001f ? vel / velLen : make_float3(0.0f, 1.0f, 0.0f);
+
+        // CalculateOrthonormal: find a vector perpendicular to velDir
+        float3 arbitrary = fabsf(velDir.x) < 0.9f ? make_float3(1.0f, 0.0f, 0.0f)
+                                                   : make_float3(0.0f, 1.0f, 0.0f);
+        float3 cylinderAxisA = normalize_f3(cross_f3(velDir, arbitrary));
+        float3 cylinderAxisB = cross_f3(cylinderAxisA, velDir);
+
+        float cylinderRadius = smoothingRadius;
+
+        for (int s = 0; s < particleSpawnCount; s++) {
+            float randomAngle = randomValue(rngState) * 2.0f * 3.14159265f;
+            float3 offsetDir  = cosf(randomAngle) * cylinderAxisA
+                              + sinf(randomAngle) * cylinderAxisB;
+
+            // sqrt for uniform distribution over disk area
+            float3 baseOffset = sqrtf(randomValue(rngState)) * cylinderRadius * offsetDir;
+            float3 spawnPos   = cylinderBase + baseOffset
+                              + (cylinderTop - cylinderBase) * randomValue(rngState);
+
+            WhiteParticle newParticle;
+            newParticle.position        = spawnPos;
+            newParticle.velocity        = vel + baseOffset;
+            newParticle.remainingLifetime = lerpf(1.0f, 5.0f, randomValue(rngState));
+            newParticle.pad             = 0.0f;
+            whiteParticles[particleIndex + s] = newParticle;
+        }
+    }
+}
+
+__global__ void UpdateWhiteParticles(
+    WhiteParticle* whiteParticles,
+    WhiteParticle* whiteParticlesCompacted,
+    WhiteParticleParams params,
+    uint32_t* whiteParticleCounters,
+    uint32_t maxWhiteParticleCount,
+    float deltaTime,
+    float gravity,
+    float boundsX, float boundsY, float boundsZ,
+    // Spatial hash
+    const float* __restrict__ fluidPosX,
+    const float* __restrict__ fluidPosY,
+    const float* __restrict__ fluidPosZ,
+    const float* __restrict__ fluidVelX,
+    const float* __restrict__ fluidVelY,
+    const float* __restrict__ fluidVelZ,
+    const uint32_t* __restrict__ spatialKeys,
+    const uint32_t* __restrict__ startIndices,
+    int numFluidParticles,
+    uint32_t hashTableSize,
+    float smoothingRadius
+)
+{
+    int id_x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (id_x >= min(maxWhiteParticleCount, whiteParticleCounters[0])) return;
+
+    WhiteParticle particle = whiteParticles[id_x];
+
+    // Classify foam/spray/bubble
+    int neighborCount = 0;
+    float3 velocitySum = make_float3(0.0f, 0.0f, 0.0f);
+    float weightSum = 0.0f;
+    float sqrRadius = smoothingRadius * smoothingRadius;
+    int3 originCell = PositionToCellCoord(particle.position, smoothingRadius);
+
+    for (int i = 0; i < 27; i++)
+    {
+        int3 neighborCell = originCell + CELL_OFFSETS[i];
+        uint32_t hash = HashCell(neighborCell.x, neighborCell.y, neighborCell.z);
+        uint32_t key = GetKeyFromHash(hash, hashTableSize);
+        uint32_t currIndex = startIndices[key];
+        if (currIndex == 0xffffffff) continue;
+
+        while (currIndex < (uint32_t)numFluidParticles)
+        {
+            uint32_t neighborIndex = currIndex;
+            uint32_t neighborKey = spatialKeys[neighborIndex];
+            currIndex++;
+            if (neighborKey != key) break;
+
+            float3 offset = make_float3(
+                __ldg(&fluidPosX[neighborIndex]) - particle.position.x,
+                __ldg(&fluidPosY[neighborIndex]) - particle.position.y,
+                __ldg(&fluidPosZ[neighborIndex]) - particle.position.z
+            );
+            float sqrDst = dot(offset, offset);
+            if (sqrDst < sqrRadius)
+            {
+                neighborCount++;
+                float weight = 1.0f - sqrtf(sqrDst) / smoothingRadius;
+                velocitySum += make_float3(
+                    __ldg(&fluidVelX[neighborIndex]),
+                    __ldg(&fluidVelY[neighborIndex]),
+                    __ldg(&fluidVelZ[neighborIndex])
+                ) * weight;
+                weightSum += weight;
+            }
+        }
+    }
+
+    bool isBubble = neighborCount >= params.bubbleThreshold;
+    bool isSpray = neighborCount <= params.sprayThreshold;
+    bool isFoam = !(isSpray || isBubble);
+
+    float airDragMultiplier = 0.4f;
+    float effectiveGravity = gravity;
+    const float boundsCollisionDampening = 0.0f;
+
+    if (isFoam)
+    {
+        particle.velocity = weightSum > 0.0f ? velocitySum / weightSum : particle.velocity;
+        particle.remainingLifetime -= deltaTime;
+    } else if (isBubble)
+    {
+        const float buoyancy = 2.0f;
+        const float fluidAccelMul = 3.0f;
+        float3 accelerationBuoyancy = make_float3(0.0f, -gravity, 0.0f) * (1.0f - buoyancy);
+        float3 accelerationFluid = weightSum > 0.0f ? (velocitySum / weightSum - particle.velocity) * fluidAccelMul :
+        make_float3(0.0f, 0.0f, 0.0f);
+        particle.velocity += (accelerationBuoyancy + accelerationFluid) * deltaTime;
+        particle.remainingLifetime -= deltaTime;
+    } else
+    {
+        const float dragMultiplier = 0.35f;
+        float3 drag = -particle.velocity * dragMultiplier;
+        particle.velocity += (make_float3(0.0f, -gravity, 0.0f) + drag) * deltaTime;
+        particle.remainingLifetime -= deltaTime;
+    }
+
+    particle.position += particle.velocity * deltaTime;
+
+    const float3 halfSize = make_float3(boundsX / 2.0f, boundsY / 2.0f, boundsZ / 2.0f);
+
+    if (particle.position.x < -halfSize.x) {
+        particle.position.x = -halfSize.x;
+        particle.velocity.x *= -1.0f * (1.0f - boundsCollisionDampening);
+    }
+    if (particle.position.x > halfSize.x) {
+        particle.position.x = halfSize.x;
+        particle.velocity.x *= -1.0f * (1.0f - boundsCollisionDampening);
+    }
+    if (particle.position.y < -halfSize.y) {
+        particle.position.y = -halfSize.y;
+        particle.velocity.y *= -1.0f * (1.0f - boundsCollisionDampening);
+    }
+    if (particle.position.y > halfSize.y) {
+        particle.position.y = halfSize.y;
+        particle.velocity.y *= -1.0f * (1.0f - boundsCollisionDampening);
+    }
+    if (particle.position.z < -halfSize.z) {
+        particle.position.z = -halfSize.z;
+        particle.velocity.z *= -1.0f * (1.0f - boundsCollisionDampening);
+    }
+    if (particle.position.z > halfSize.z) {
+        particle.position.z = halfSize.z;
+        particle.velocity.z *= -1.0f * (1.0f - boundsCollisionDampening);
+    }
+
+    whiteParticles[id_x] = particle;
+
+    if (particle.remainingLifetime > 0)
+    {
+        uint32_t survivorIndex = atomicAdd(&whiteParticleCounters[1], 1u);
+        whiteParticlesCompacted[survivorIndex] = particle;
+    }
+}
+
+__global__ void WhiteParticlePrepareNextFrame(
+    WhiteParticle* whiteParticles,
+    WhiteParticle* whiteParticlesCompacted,
+    uint32_t* whiteParticleCounters
+)
+{
+    int id_x = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t survivorCount = whiteParticleCounters[1];
+
+    if (id_x < survivorCount)
+    {
+        whiteParticles[id_x] = whiteParticlesCompacted[id_x];
+    }
+
+    if (id_x == 0)
+    {
+        whiteParticleCounters[0] = survivorCount;
+    }
+}
+
 void SPHSolver::UpdateSpatialLookup() {
     int blockSize = 256;
     int numBlock = (m_numParticles + blockSize - 1) / blockSize;
@@ -1101,6 +1433,8 @@ SPHSolver::SPHSolver(int maxParticles) : m_maxParticles(maxParticles), m_numPart
     cudaMalloc(&d_startIndices, m_hashTableSize * sizeof(uint32_t));
     cudaMalloc(&d_colliders, 10 * sizeof(Collider));
     cudaMalloc(&d_aos_temp, m_maxParticles * 3 * sizeof(float));
+
+    cudaMalloc(&d_trappedAir, m_maxParticles * sizeof(float));
 }
 
 SPHSolver::~SPHSolver() {
@@ -1136,6 +1470,12 @@ SPHSolver::~SPHSolver() {
     if (d_startIndices) cudaFree(d_startIndices);
     if (d_aos_temp) cudaFree(d_aos_temp);
     if (d_colliders) cudaFree(d_colliders);
+    if (d_whiteParticles) cudaFree(d_whiteParticles);
+    if (d_whiteParticlesCompact) cudaFree(d_whiteParticlesCompact);
+    if (d_whiteCounters) cudaFree(d_whiteCounters);
+    if (d_trappedAir) cudaFree(d_trappedAir);
+    if (h_whiteParticlesPinned) cudaFreeHost(h_whiteParticlesPinned);
+    if (h_whiteCountPinned)     cudaFreeHost(h_whiteCountPinned);
 }
 
 void SPHSolver::init(const std::vector<float> &positions, const std::vector<float> &velocities) {
@@ -1168,6 +1508,15 @@ void SPHSolver::init(const std::vector<float> &positions, const std::vector<floa
     cudaMemcpy(d_velX, h_velX.data(), copySize, cudaMemcpyHostToDevice);
     cudaMemcpy(d_velY, h_velY.data(), copySize, cudaMemcpyHostToDevice);
     cudaMemcpy(d_velZ, h_velZ.data(), copySize, cudaMemcpyHostToDevice);
+
+    m_maxWhiteParticles = m_wpParams.maxWhiteParticles;
+    cudaMalloc(&d_whiteParticles, m_maxWhiteParticles * sizeof(WhiteParticle));
+    cudaMalloc(&d_whiteParticlesCompact, m_maxWhiteParticles * sizeof(WhiteParticle));
+    cudaMalloc(&d_whiteCounters, 2 * sizeof(uint32_t));
+    cudaMemset(d_whiteParticles, 0, m_maxWhiteParticles * sizeof(WhiteParticle));
+    cudaMemset(d_whiteCounters, 0, 2 * sizeof(uint32_t));
+    cudaMallocHost((void**)&h_whiteParticlesPinned, m_maxWhiteParticles * sizeof(WhiteParticle));
+    cudaMallocHost((void**)&h_whiteCountPinned, sizeof(uint32_t));
 
     float h = m_params.smoothingRadius;
     float h5 = powf(h, 5.0f);
@@ -1230,6 +1579,7 @@ void SPHSolver::update(float dt) {
         d_velX, d_velY, d_velZ,
         d_densities,
         d_nearDensities,
+        d_trappedAir,
         d_spatialIndices, d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
         m_params.smoothingRadius, m_params.targetDensity, m_params.pressureMultiplier,
         m_params.nearPressureMultiplier, m_params.viscosityStrength, dt,
@@ -1247,6 +1597,28 @@ void SPHSolver::update(float dt) {
         m_numParticles,
         m_params.particleSize, m_params.boundsX, m_params.boundsY, m_params.boundsZ,
         m_params.collisionDamping, m_params.gravity, dt, d_colliders, m_numColliders, m_params.smoothingRadius, m_params.colliderDragMultiplier);
+
+    // White particle simulation
+    int wpBlockSize = 256;
+
+    int spawnNumBlock = (m_numParticles + wpBlockSize - 1) / wpBlockSize;
+    SpawnWhiteParticles<<<spawnNumBlock, wpBlockSize>>>(d_posX, d_posY, d_posZ,
+        d_velX, d_velY, d_velZ,
+        d_trappedAir,
+        d_whiteParticles, d_whiteCounters,
+        m_numParticles, m_maxWhiteParticles, m_simTime, dt, m_params.smoothingRadius, m_wpParams);
+
+    int wpNumBlock = (m_maxWhiteParticles + wpBlockSize - 1) / wpBlockSize;
+    UpdateWhiteParticles<<<wpNumBlock, wpBlockSize>>>(d_whiteParticles,
+        d_whiteParticlesCompact, m_wpParams, d_whiteCounters, m_maxWhiteParticles, dt, m_params.gravity,
+        m_params.boundsX, m_params.boundsY, m_params.boundsZ,
+        d_posX, d_posY, d_posZ,
+        d_velX, d_velY, d_velZ,
+        d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize, m_params.smoothingRadius);
+
+    WhiteParticlePrepareNextFrame<<<wpNumBlock, wpBlockSize>>>(d_whiteParticles, d_whiteParticlesCompact, d_whiteCounters);
+
+    m_simTime += dt;
 
     if (m_numColliders > 0)
     {
@@ -1291,4 +1663,46 @@ void SPHSolver::getVelocities(float* outVelocities)
 
 void SPHSolver::setParams(const SPHParams &params) {
     m_params = params;
+}
+
+
+void SPHSolver::getWhiteParticles(float* outPositions, uint32_t& outCount)
+{
+    uint32_t count = 0;
+    cudaMemcpy(&count, d_whiteCounters, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    outCount = min(count, m_maxWhiteParticles);
+    if (outCount == 0) return;
+
+    std::vector<WhiteParticle> temp(outCount);
+    cudaMemcpy(temp.data(), d_whiteParticles, outCount * sizeof(WhiteParticle), cudaMemcpyDeviceToHost);
+
+    for (uint32_t i = 0; i < outCount; ++i)
+    {
+        outPositions[i * 3 + 0] = temp[i].position.x;
+        outPositions[i * 3 + 1] = temp[i].position.y;
+        outPositions[i * 3 + 2] = temp[i].position.z;
+    }
+}
+
+void SPHSolver::getWhiteParticles(std::vector<WhiteParticle>& out)
+{
+    uint32_t count = 0;
+    cudaMemcpy(&count, d_whiteCounters, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    count = min(count, m_maxWhiteParticles);
+    if (count == 0) return;
+    out.resize(count);
+    cudaMemcpy(out.data(), d_whiteParticles, count * sizeof(WhiteParticle), cudaMemcpyDeviceToHost);
+}
+
+void SPHSolver::requestWhiteParticles()
+{
+    cudaMemcpyAsync(h_whiteCountPinned, d_whiteCounters, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(h_whiteParticlesPinned, d_whiteParticles, m_maxWhiteParticles * sizeof(WhiteParticle),
+        cudaMemcpyDeviceToHost);
+}
+
+void SPHSolver::finalizeWhiteParticles(std::vector<WhiteParticle>& out)
+{
+    uint32_t count = min(*h_whiteCountPinned, m_maxWhiteParticles);
+    out.assign(h_whiteParticlesPinned, h_whiteParticlesPinned + count);
 }
