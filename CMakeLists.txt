@@ -2,8 +2,11 @@ cmake_minimum_required(VERSION 4.1)
 project(AnitoWave_SPH CUDA CXX)
 include(FetchContent)
 
-set(CMAKE_CUDA_STANDARD 23)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if (MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -13,6 +16,12 @@ if (MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/arch:AVX512>)
 endif ()
+
+# Force MSVC / Visual Studio to automatically pass CUDA symbols to the IntelliSense engine
+if(MSVC)
+    add_compile_definitions($<$<BOOL:$<CONFIG>>:__CUDACC__>)
+    set(CMAKE_VS_INTELISENSE_ARCHITECTURE "amd64")
+endif()
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
@@ -96,44 +105,34 @@ add_executable(AnitoWave_SPH ${sources})
 target_compile_options(AnitoWave_SPH PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
 
 target_include_directories(AnitoWave_SPH PRIVATE
+        ${CMAKE_BINARY_DIR}/_deps/trianglemeshdistance-src/TriangleMeshDistance/include
+        $ENV{CUDA_PATH}/include
         bgfx/include
         bx/include
         bimg/include
-        ${CMAKE_BINARY_DIR}/_deps/trianglemeshdistance-src/TriangleMeshDistance/include
-)
-
-target_include_directories(AnitoWave_SPH PRIVATE
         bgfx/3rdparty
         bgfx/examples/common
 )
 
 target_link_directories(AnitoWave_SPH PRIVATE ./bgfx/.build/win64_vs2022/bin/)
 
+target_compile_definitions(AnitoWave_SPH PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:CCCL_IGNORE_DEPRECATED_CPP_DIALECT>
+        $<$<CONFIG:Debug>:BX_CONFIG_DEBUG=1>
+        $<$<CONFIG:Release>:BX_CONFIG_DEBUG=0>
+)
 
-if ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
-    if (NOT EXISTS "${PROJECT_SOURCE_DIR}/bgfx/.build/win64_vs2022/bin/bgfxDebug.lib")
-        message(FATAL_ERROR "BGFX not build as debug.")
-    endif ()
-    target_link_libraries(AnitoWave_SPH
-            bgfxDebug
-            bimgDebug
-            bxDebug
-            bimg_decodeDebug
-            dear-imgui
-    )
-    target_compile_definitions(AnitoWave_SPH PRIVATE BX_CONFIG_DEBUG=1)
-elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "Release")
-    if (NOT EXISTS "${PROJECT_SOURCE_DIR}/bgfx/.build/win64_vs2022/bin/bgfxRelease.lib")
-        message(FATAL_ERROR "BGFX not build as release.")
-    endif ()
-    target_link_libraries(AnitoWave_SPH
-            bimg_decodeRelease
-            bgfxRelease
-            bimgRelease
-            bxRelease
-    )
-    target_compile_definitions(AnitoWave_SPH PRIVATE BX_CONFIG_DEBUG=0)
-endif ()
+target_link_libraries(AnitoWave_SPH
+        $<$<CONFIG:Debug>:bgfxDebug>
+        $<$<CONFIG:Debug>:bimgDebug>
+        $<$<CONFIG:Debug>:bxDebug>
+        $<$<CONFIG:Debug>:bimg_decodeDebug>
+        $<$<CONFIG:Release>:bgfxRelease>
+        $<$<CONFIG:Release>:bimgRelease>
+        $<$<CONFIG:Release>:bxRelease>
+        $<$<CONFIG:Release>:bimg_decodeRelease>
+        dear-imgui
+)
 
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/bgfx/3rdparty/dear-imgui)
 file(GLOB IMGUI_SOURCES
@@ -158,11 +157,10 @@ target_include_directories(dear-imgui PUBLIC
 )
 target_link_libraries(AnitoWave_SPH dear-imgui)
 
-if ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
-    target_compile_definitions(dear-imgui PRIVATE BX_CONFIG_DEBUG=1)
-else ()
-    target_compile_definitions(dear-imgui PRIVATE BX_CONFIG_DEBUG=0)
-endif()
+target_compile_definitions(dear-imgui PRIVATE
+        $<$<CONFIG:Debug>:BX_CONFIG_DEBUG=1>
+        $<$<CONFIG:Release>:BX_CONFIG_DEBUG=0>
+)
 
 if (MSVC)
     target_include_directories(dear-imgui PUBLIC "${CMAKE_SOURCE_DIR}/bx/include/compat/msvc")
@@ -185,10 +183,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(tinyobjloader)
 
+set(TINYGLTF_HEADER_ONLY ON CACHE BOOL "" FORCE)
+set(TINYGLTF_INSTALL OFF CACHE BOOL "" FORCE)
+set(TINYGLTF_BUILD_LOADER_EXAMPLE OFF CACHE BOOL "" FORCE)
+
 FetchContent_Declare(
         tinygltf
         GIT_REPOSITORY https://github.com/syoyo/tinygltf.git
-        GIT_TAG        release
+        GIT_TAG        v2.9.7
 )
 FetchContent_MakeAvailable(tinygltf)
 
@@ -196,6 +198,18 @@ target_link_libraries(AnitoWave_SPH glfw tinyobjloader tinygltf)
 
 add_dependencies(AnitoWave_SPH compile_shaders)
 
+# -----------------
+# Shaders folder
+# -----------------
+add_custom_target(CopyShaders
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${SHADER_BINARY_DIR}"
+        "$<TARGET_FILE_DIR:AnitoWave_SPH>/shaders"
+        COMMENT "Copying compiled shaders to output directory..."
+)
+
+add_dependencies(CopyShaders compile_shaders)
+add_dependencies(AnitoWave_SPH CopyShaders)
 
 # -----------------
 # Mesh folder

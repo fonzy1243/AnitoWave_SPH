@@ -177,18 +177,30 @@ __device__ void atomicAddFloat3(float3* address, float3 val) {
     atomicAdd(&address->z, val.z);
 }
 
-__device__ uint32_t randomState(float3 pos, float simTime) {
-    uint32_t ux = __float_as_uint(pos.x);
-    uint32_t uy = __float_as_uint(pos.y);
-    uint32_t uz = __float_as_uint(pos.z);
-    uint32_t ut = __float_as_uint(simTime);
-
-    return ux * 19349669u
-         + uy * 83492837u
-         + uz * 73856131u
-         + ut * 4785773u;
+__device__ uint32_t hashUint(uint32_t x) {
+    x = ((x >> 16) ^ x) * 0x45d9f3b;
+    x = ((x >> 16) ^ x) * 0x45d9f3b;
+    x = (x >> 16) ^ x;
+    return x;
 }
 
+//__device__ uint32_t randomState(float3 pos, float simTime) {
+//    uint32_t ux = __float_as_uint(pos.x);
+//    uint32_t uy = __float_as_uint(pos.y);
+//    uint32_t uz = __float_as_uint(pos.z);
+//    uint32_t ut = __float_as_uint(simTime);
+//
+//    return ux * 19349669u
+//         + uy * 83492837u
+//         + uz * 73856131u
+//         + ut * 4785773u;
+//}
+
+
+__device__ uint32_t randomState(int id, float simTime) {
+    uint32_t ut = __float_as_uint(simTime);
+    return hashUint((uint32_t)id ^ hashUint(ut));
+}
 __device__ float randomValue(uint32_t& rngState) {
     rngState ^= rngState << 13;
     rngState ^= rngState >> 17;
@@ -399,7 +411,8 @@ __device__ uint32_t GetKeyFromHash(uint32_t hash, uint32_t hashTableSize) {
 __device__ float2 ConvertDensityToPressure(float density, float nearDensity, float targetDensity, float pressureMultiplier, float nearPressureMultiplier) {
     float densityError = density  - targetDensity;
     float pressure = densityError  * pressureMultiplier;
-    pressure = max(pressure, -150.0f);
+    // pressure = max(pressure, -150.0f);
+    pressure = max(pressure, 0.0f);
     float nearPressure = nearDensity * nearPressureMultiplier;
 
     return make_float2(pressure, nearPressure);
@@ -424,7 +437,7 @@ __device__ float SmoothingKernel(float dst, float radius, float scale) {
 __device__ float SmoothingKernelDerivative(float dst, float radius, float scale) {
     if (dst >= radius) return 0.0f;
     float v = radius - dst;
-    return -v * scale;
+    return -(v * v) * scale;
 }
 
 __device__ float ViscositySmoothingKernel(float dst, float radius, float scale) {
@@ -464,6 +477,8 @@ __device__ float3 normalize_f3(float3 v)
     float len = length(v);
     return len > 0.000001f ? v / len : make_float3(0.0f, 1.0f, 0.0f);
 }
+
+
 
 __global__
 // __launch_bounds__(256, 2)
@@ -732,42 +747,64 @@ __global__ void UpdatePositions(
         }
     }
 
-    const float3 halfSize = make_float3(boundsX / 2.0f, boundsY / 2.0f, boundsZ / 2.0f);
-    float containerDist = -sdfBox(posLocal, halfSize);
+    //const float3 halfSize = make_float3(boundsX / 2.0f, boundsY / 2.0f, boundsZ / 2.0f);
+    //float containerDist = -sdfBox(posLocal, halfSize);
 
-    if (containerDist < particleSize)
-    {
-        float3 normal = CalculateBoundsNormal(posLocal, halfSize);
-        float penetration = particleSize - containerDist;
+    //if (containerDist < particleSize)
+    //{
+    //    float3 normal = CalculateBoundsNormal(posLocal, halfSize);
+    //    float penetration = particleSize - containerDist;
+    //    posLocal += normal * penetration;
 
-        posLocal += normal * penetration;
+    //    float normalVel = dot(velLocal, normal);
+    //    if (normalVel < 0)
+    //    {
+    //        float3 velocityChange = normal * normalVel * (1.0f + collisionDamping);
+    //        velLocal -= velocityChange;
+    //    }
+    //}
 
-        float normalVel = dot(velLocal, normal);
-        if (normalVel < 0)
-        {
-            float3 velocityChange = normal * normalVel * (1.0f + collisionDamping);
-            velLocal -= velocityChange;
-        }
+    const float3 halfBounds = make_float3(
+        boundsX * 0.5f - particleSize,
+        boundsY * 0.5f - particleSize,
+        boundsZ * 0.5f - particleSize
+    );
+
+    int boundaryHits = 0;
+
+    // X-Axis
+    if (posLocal.x < -halfBounds.x) {
+        posLocal.x = -halfBounds.x;
+		if (velLocal.x < 0.0f) velLocal.x *= -collisionDamping; boundaryHits++;
+    }
+    else if (posLocal.x > halfBounds.x) {
+        posLocal.x = halfBounds.x;
+		if (velLocal.x > 0.0f) velLocal.x *= -collisionDamping; boundaryHits++;
     }
 
-    // const float3 edgeDst = make_float3(
-    //     halfSize.x - abs(posLocal.x) - particleSize,
-    //     halfSize.y - abs(posLocal.y) - particleSize,
-    //     halfSize.z - abs(posLocal.z) - particleSize
-    // );
-    //
-    // if (edgeDst.x <= 0) {
-    //     posLocal.x = (halfSize.x - particleSize) * sign(posLocal.x);
-    //     if (posLocal.x * velLocal.x > 0.0f) velLocal.x *= -1.0f * collisionDamping;
-    // }
-    // if (edgeDst.y <= 0) {
-    //     posLocal.y = (halfSize.y - particleSize) * sign(posLocal.y);
-    //     if (posLocal.y * velLocal.y > 0.0f) velLocal.y *= -1.0f * collisionDamping;
-    // }
-    // if (edgeDst.z <= 0) {
-    //     posLocal.z = (halfSize.z - particleSize) * sign(posLocal.z);
-    //     if (posLocal.z * velLocal.z > 0.0f) velLocal.z *= -1.0f * collisionDamping;
-    // }
+    // Y-Axis (Floor & Ceiling)
+    if (posLocal.y < -halfBounds.y) {
+        posLocal.y = -halfBounds.y;
+		if (velLocal.y < 0.0f) velLocal.y *= -collisionDamping; boundaryHits++;
+    }
+    else if (posLocal.y > halfBounds.y) {
+        posLocal.y = halfBounds.y;
+		if (velLocal.y > 0.0f) velLocal.y *= -collisionDamping; boundaryHits++;
+    }
+
+    // Z-Axis
+    if (posLocal.z < -halfBounds.z) {
+        posLocal.z = -halfBounds.z;
+        if (velLocal.z < 0.0f) velLocal.z *= -collisionDamping; boundaryHits++;
+    }
+    else if (posLocal.z > halfBounds.z) {
+        posLocal.z = halfBounds.z;
+        if (velLocal.z > 0.0f) velLocal.z *= -collisionDamping; boundaryHits++;
+    }
+
+    if (boundaryHits >= 2) {
+        velLocal *= 0.5f; // Extra damping in edges and corners to kill rattling
+    }
 
     const float MAX_SPEED = 60.0f;
     float speed = length(velLocal);
@@ -918,14 +955,31 @@ __global__ void PredictPositions(
     float* posX, float* posY, float* posZ,
     float* predPosX, float* predPosY, float* predPosZ,
     float* velX, float* velY, float* velZ,
-    int numParticles, float gravity, float dt) {
+    int numParticles, float gravity, float dt, float boundsX, float boundsY, float boundsZ, float particleSize) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numParticles) return;
 
     velY[i] += -1 * gravity * dt;
-    predPosX[i] = posX[i] + velX[i] * dt;
-    predPosY[i] = posY[i] + velY[i] * dt;
-    predPosZ[i] = posZ[i] + velZ[i] * dt;
+
+    float3 pred = make_float3(
+        posX[i] + velX[i] * dt,
+        posY[i] + velY[i] * dt,
+        posZ[i] + velZ[i] * dt
+    );
+
+    const float3 halfSize = make_float3(
+        boundsX * 0.5f - particleSize,
+        boundsY * 0.5f - particleSize,
+        boundsZ * 0.5f - particleSize
+    );
+
+    pred.x = fmaxf(-halfSize.x, fminf(halfSize.x, pred.x));
+    pred.y = fmaxf(-halfSize.y, fminf(halfSize.y, pred.y));
+    pred.z = fmaxf(-halfSize.z, fminf(halfSize.z, pred.z));
+
+    predPosX[i] = pred.x;
+    predPosY[i] = pred.y;
+    predPosZ[i] = pred.z;
 }
 
 __global__
@@ -1129,6 +1183,14 @@ __global__ void ReorderVelocities(
 //     }
 // }
 
+__device__ inline void BuildOrthonormalBasis(float3 n, float3& b1, float3& b2) {
+    float sign = copysignf(1.0f, n.z);
+    const float a = -1.0f / (sign + n.z);
+    const float b = n.x * n.y * a;
+    b1 = make_float3(1.0f + sign * n.x * n.x * a, sign * b, -sign * n.x);
+    b2 = make_float3(b, sign + n.y * n.y * a, -n.y);
+}
+
 __global__ void SpawnWhiteParticles(
     const float* __restrict__ posX,
     const float* __restrict__ posY,
@@ -1147,14 +1209,19 @@ __global__ void SpawnWhiteParticles(
     WhiteParticleParams params
 )
 {
-    int id_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= numParticles) return;
+
+    uint32_t frameSeed = hashUint(__float_as_uint(simTime));
+
+    int id_x = (int)(((uint32_t)t + frameSeed) % (uint32_t)numParticles);
     if (id_x >= numParticles) return;
     // Reset survivor counter
     if (id_x == 0) whiteParticleCounters[1] = 0;
 
     float3 pos = make_float3(posX[id_x], posY[id_x], posZ[id_x]);
     float3 vel = make_float3(velX[id_x], velY[id_x], velZ[id_x]);
-    uint32_t rngState = randomState(pos, simTime);
+    uint32_t rngState = randomState(id_x, simTime);
 
     float ta = trappedAir[id_x];
     float trappedAirFactor = clampf((ta - params.trappedAirMin) / max(0.000001f,
@@ -1186,8 +1253,10 @@ __global__ void SpawnWhiteParticles(
         // CalculateOrthonormal: find a vector perpendicular to velDir
         float3 arbitrary = fabsf(velDir.x) < 0.9f ? make_float3(1.0f, 0.0f, 0.0f)
                                                    : make_float3(0.0f, 1.0f, 0.0f);
-        float3 cylinderAxisA = normalize_f3(cross_f3(velDir, arbitrary));
-        float3 cylinderAxisB = cross_f3(cylinderAxisA, velDir);
+        //float3 cylinderAxisA = normalize_f3(cross_f3(velDir, arbitrary));
+        //float3 cylinderAxisB = cross_f3(cylinderAxisA, velDir);
+        float3 cylinderAxisA, cylinderAxisB;
+        BuildOrthonormalBasis(velDir, cylinderAxisA, cylinderAxisB);
 
         float cylinderRadius = smoothingRadius;
 
@@ -1445,6 +1514,7 @@ SPHSolver::~SPHSolver() {
         }
     }
 
+    // Particle attributes
     if (d_posX) cudaFree(d_posX);
     if (d_posY) cudaFree(d_posY);
     if (d_posZ) cudaFree(d_posZ);
@@ -1462,6 +1532,8 @@ SPHSolver::~SPHSolver() {
     if (d_sortedVelZ) cudaFree(d_sortedVelZ);
     if (d_densities) cudaFree(d_densities);
     if (d_nearDensities) cudaFree(d_nearDensities);
+
+    // Hashing
     if (d_spatialIndices) cudaFree(d_spatialIndices);
     if (d_spatialKeys) cudaFree(d_spatialKeys);
     if (d_spatialIndicesSorted) cudaFree(d_spatialIndicesSorted);
@@ -1525,7 +1597,7 @@ void SPHSolver::init(const std::vector<float> &positions, const std::vector<floa
     float pi = std::numbers::pi_v<float>;
 
     m_params.densityScale = 15.0f / (2.0f * pi * h5);
-    m_params.pressureScale = 15.0f / (pi * h5);
+    m_params.pressureScale = 45.0f / (pi * h6);
     m_params.nearDensityScale = 15.0f / (pi * h6);
     m_params.nearPressureScale = 45.0f / (pi * h6);
     m_params.viscosityScale = 315.0f / (64.0f * pi * h9);
@@ -1541,7 +1613,7 @@ void SPHSolver::update(float dt) {
         d_posX, d_posY, d_posZ,
         d_predX, d_predY, d_predZ,
         d_velX, d_velY, d_velZ,
-        m_numParticles, m_params.gravity, dt);
+        m_numParticles, m_params.gravity, dt, m_params.boundsX, m_params.boundsY, m_params.boundsZ, m_params.particleSize);
 
     UpdateSpatialLookup();
 
@@ -1566,11 +1638,11 @@ void SPHSolver::update(float dt) {
     // Calculate and apply densities
     size_t smemDensity = blockSize * 3 * sizeof(float);
     UpdateDensities_Optimized<<<numBlock, blockSize, smemDensity>>>(
-         d_predX, d_predY, d_predZ,
-         d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
-         m_params.smoothingRadius, m_params.densityScale, m_params.nearDensityScale,
-         d_densities, d_nearDensities
-     );
+        d_predX, d_predY, d_predZ,
+        d_spatialKeys, d_startIndices, m_numParticles, m_hashTableSize,
+        m_params.smoothingRadius, m_params.densityScale, m_params.nearDensityScale,
+        d_densities, d_nearDensities
+        );
 
     // Calculate and apply pressure forces
     size_t smemPressure = blockSize * 16 * sizeof(float);
@@ -1584,7 +1656,7 @@ void SPHSolver::update(float dt) {
         m_params.smoothingRadius, m_params.targetDensity, m_params.pressureMultiplier,
         m_params.nearPressureMultiplier, m_params.viscosityStrength, dt,
         m_params.pressureScale, m_params.viscosityScale, m_params.nearPressureScale
-    );
+        );
 
     // ReorderVelocities<<<numBlock, blockSize>>>(m_numParticles, d_spatialIndices,
     //     d_sortedVelX, d_sortedVelY, d_sortedVelZ,
@@ -1628,7 +1700,6 @@ void SPHSolver::update(float dt) {
 
     cudaDeviceSynchronize();
 }
-
 void SPHSolver::addCollider(Collider collider) {
     m_colliders.push_back(collider);
     m_numColliders = m_colliders.size();

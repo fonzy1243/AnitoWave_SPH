@@ -1,16 +1,20 @@
 #ifndef ANITOWAVE_SPH_SPH_CUH
 #define ANITOWAVE_SPH_SPH_CUH
 
-#include <tiny_obj_loader.h>
-#include <tiny_gltf.h>
-#include <tmd/TriangleMeshDistance.h>
 #include <iostream>
 #include <vector>
 #include <array>
 #include <string>
 #include <algorithm>
 #include <numbers>
+
+#include <tiny_obj_loader.h>
+#include <tiny_gltf.h>
+#include <tmd/TriangleMeshDistance.h>
 #include <bx/math.h>
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
 #include <cub/cub.cuh>
 #include <thrust/sort.h>
 #include <thrust/device_ptr.h>
